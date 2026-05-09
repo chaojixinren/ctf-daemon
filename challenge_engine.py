@@ -17,8 +17,9 @@ logger = logging.getLogger("challenge_engine")
 
 # ── Flag Rescue Cache ─────────────────────────────────────────────
 
+from state import RESCUE_FLAGS_PATH
+
 _RESCUE_FLAGS_LOCK = threading.Lock()
-_RESCUE_FLAGS_PATH = Path("/tmp/ctf_flags_rescue.txt")
 _RESCUED_FLAGS: set[tuple[int, str]] = set()  # (challenge_id, flag)
 
 
@@ -26,8 +27,8 @@ def load_rescue_flags() -> list[tuple[int, str]]:
     """Load previously cached flags that need retrying."""
     flags = []
     try:
-        if _RESCUE_FLAGS_PATH.exists():
-            for line in _RESCUE_FLAGS_PATH.read_text().splitlines():
+        if RESCUE_FLAGS_PATH.exists():
+            for line in RESCUE_FLAGS_PATH.read_text().splitlines():
                 line = line.strip()
                 if not line:
                     continue
@@ -49,17 +50,17 @@ def save_rescue_flag(challenge_id: int, flag: str, reason: str = "") -> str:
     key = (challenge_id, flag.strip())
     with _RESCUE_FLAGS_LOCK:
         if key in _RESCUED_FLAGS:
-            return str(_RESCUE_FLAGS_PATH)
+            return str(RESCUE_FLAGS_PATH)
         _RESCUED_FLAGS.add(key)
         try:
-            _RESCUE_FLAGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            RESCUE_FLAGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             ts = datetime.now().astimezone().isoformat(timespec="seconds")
-            with _RESCUE_FLAGS_PATH.open("a") as f:
+            with RESCUE_FLAGS_PATH.open("a") as f:
                 f.write(f"{challenge_id}\t{flag}\t{reason}\t{ts}\n")
             logger.info(f"[Rescue] Flag cached for retry: challenge={challenge_id}")
         except Exception as e:
             logger.warning(f"[Rescue] Failed to cache flag: {e}")
-    return str(_RESCUE_FLAGS_PATH)
+    return str(RESCUE_FLAGS_PATH)
 
 
 def remove_rescue_flag(challenge_id: int, flag: str):
@@ -361,14 +362,19 @@ def categorize_file(filepath: str) -> str:
             capture_output=True, text=True, timeout=10
         )
         output = result.stdout.lower()
-        
+
+        # Extension-based checks (independent of file output)
+        if filepath.endswith(".pyc"):
+            return "python_bytecode"
+
+        # Content-based checks
         if "elf" in output:
             return "binary_elf"
         elif "pe32" in output or "pe64" in output:
             return "binary_pe"
         elif "zip" in output or "archive" in output:
             return "archive"
-        elif "python" in output or path.endswith(".pyc"):
+        elif "python" in output:
             return "python_bytecode"
         elif "pcap" in output:
             return "pcap"

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-CTF Daemon v3 — Multi-slot concurrent orchestrator.
-             精灵学会了分身术，同时处理多道题目。
+CTF Daemon v3.1 — Multi-slot concurrent orchestrator with LLM-driven selection.
+             精灵学会了分身术，同时处理多道题目，LLM 按难度自主排序。
 
 Each "slot" is an independent challenge pipeline. The daemon fills empty 
 slots with eligible challenges, collects flags from all slots, and aborts 
@@ -29,8 +29,9 @@ SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from gzctf_client import GZCTFClient, load_config
-from challenge_engine import ChallengeAnalyzer, extract_flag, build_solving_prompt
-from solver import submit_and_record, load_state, save_state
+from challenge_engine import ChallengeAnalyzer, extract_flag, build_solving_prompt, basic_file_analysis
+from solver import submit_and_record
+from state import load_state, save_state, TASKS_DIR
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                     format="%(asctime)s [daemon] %(message)s")
@@ -38,7 +39,6 @@ logger = logging.getLogger("ctf_daemon")
 
 # ── Slots ──────────────────────────────────────────────────────────
 
-TASKS_DIR  = Path("/tmp/ctf_tasks")
 DONE_FILE  = Path("/tmp/ctf_done")
 LEGACY_TASK = Path("/tmp/ctf_task.json")   # v2 compatibility
 LEGACY_FLAG = Path("/tmp/ctf_flag.txt")
@@ -98,7 +98,8 @@ def check_abort(slot: int) -> dict | None:
     f = abort_file(slot)
     if f.exists():
         try: return json.loads(f.read_text())
-        except: pass
+        except (json.JSONDecodeError, OSError):
+            logger.warning(f"[Slot {slot}] Corrupted abort file, ignoring")
     return None
 
 # ── Attempt history ────────────────────────────────────────────────
@@ -323,8 +324,8 @@ def main():
     # ── Sync with platform truth ──────────────────────────────────
     _sync_solved_from_platform(state, client)
     solved_ids = set(state["solved"].keys())
-    # No more permanent failure — keep trying forever
-    # perm_failed is kept for backward compat but not used for filtering
+    # v3.1: Never permanently fail a challenge — always allow retries.
+    # perm_failed is kept for backward compat only, not used for filtering.
 
     # ── Legacy migration: if old task files exist, move to slot 0 ──
     if LEGACY_TASK.exists() and slots.get("0") is None:
@@ -341,7 +342,8 @@ def main():
                 LEGACY_TASK.unlink()
                 save_state(state)
                 logger.info(f"Migrated legacy task to slot 0: challenge {ch_id}")
-        except Exception:
+        except (json.JSONDecodeError, OSError, KeyError) as e:
+            logger.warning(f"Legacy migration failed: {e}")
             if LEGACY_TASK.exists(): LEGACY_TASK.unlink()
 
     if LEGACY_FLAG.exists():
@@ -421,7 +423,6 @@ def main():
     for ch in all_challenges:
         ch_id = str(ch.get("id"))
         if ch_id in solved_ids:     continue
-        if False:    continue  # perm_failed removed — never give up
         if ch_id in in_flight:      continue  # already in another slot
         cooldown = state.get("cooldown_until", {}).get(ch_id, 0)
         if cooldown > now_ts:       continue
@@ -532,7 +533,6 @@ def main():
         # Check attachments for flags
         found_in_attach = False
         for path in attachments:
-            from challenge_engine import basic_file_analysis
             fa = basic_file_analysis(path)
             if fa.get("flags_in_strings"):
                 for f in fa["flags_in_strings"]:

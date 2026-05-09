@@ -170,33 +170,59 @@ python3 submit_flag.py <id> "flag{...}"  # 手动献祭 flag
 
 ```
 LOOP:
-  1. execute_code → python3 ctf_daemon.py
-     精灵的回应（机器可读）：
-     "TASK:id:category:title"   → 有新任务！
-     "ABORT:id:reason:elapsed"  → 精灵放弃了当前题，你也停手！
-     "PENDING:id:elapsed_secs"  → 还在工作中，继续
-     "DONE"                     → 全部完成，功成身退
+  1. 运行 daemon: cd /path/to/ctf-daemon && python3 ctf_daemon.py
+     解析输出：
+     "MENU:N:..."         → Daemon 写了 /tmp/ctf_menu.jsonl，等待 LLM 选择
+                             第 2 步：LLM 读取菜单，分析难度，写回 selection
+     "DISPATCH:2/3:..."   → 槽位已填充。第 3 步：解题
+     "BUSY:3/3:..."       → 所有槽位占用中。第 3 步：解题
+     "WAITING:N..."       → 题目在冷却中。等待 60s，回到 1
+     "DONE"               → 全部题目平台验证通过。结束
 
-  2. 收到 ABORT → 检查 /tmp/ctf_abort，立刻停手，回到 1
+  2. LLM SELECTION（daemon 输出 MENU 时）：
+     a. read_file /tmp/ctf_menu.jsonl — 分析每题：
+        - DynamicAttachment 优先于 DynamicContainer（无需等容器）
+        - 检查 content_preview 中是否已有 flag
+        - Misc/Crypto 通常比 Web/Pwn 容易
+     b. 选 3 道最有把握的题
+     c. write_file /tmp/ctf_selection.json:
+        {"challenge_ids": ["id1","id2","id3"], "reasoning": "..."}
+     d. 回到 1（daemon 会读取 selection 并分发）
 
-  3. 收到 TASK → read_file /tmp/ctf_task.json
-     → retry_number: 第几次尝试
-     → attempt_history: 精灵记录的前几次尝试（别再踩同样的坑！）
+  3. SOLVE 已分发的槽位：
+     a. read_file /tmp/ctf_tasks/slot_N.json
+     b. 先检查 /tmp/ctf_tasks/abort_N — 如果存在，跳过此槽位
+     c. 用 Kali MCP 工具解题
+     d. attempt_history 字段显示之前试过的工具 — 别重蹈覆辙
+     e. 找到 flag → write_file /tmp/ctf_tasks/flag_N.txt
+        内容只写 flag 字符串，例：dutctf{some_flag_here}
 
-  4. 用 Kali MCP 工具解题（nmap, sqlmap, nuclei, gobuster, pwnpasi...）
-     过程中每隔 5-10 个工具调用检查一次 /tmp/ctf_abort
-
-  5. 找到 flag → write_file /tmp/ctf_flag.txt（只要 flag，不要废话）
-
-  6. 回到 1
+  4. 回到 1
 ```
+
+## 精灵的能力 · What the Daemon Does
+
+| 能力 | 说明 |
+|------|------|
+| 🪞 **并发分身 (v3)** | 最多 3 个槽位同时跑不同题目，一个卡住不影响其他 |
+| 🔄 **轮询守护** | 每 60s 醒来一次，检查进度、提交 flag、分配新题 |
+| ⏰ **超时放弃** | 600s 解不出？自动放弃，换下一题，不堵路 |
+| 🛑 **中断信号** | 写 `/tmp/ctf_tasks/abort_N`，告诉 agent "别白费力气了" |
+| 📝 **记忆回溯** | 记录每次尝试用了什么工具、什么结果，重试时注入上下文 |
+| 🔙 **退避重试** | 失败后 60s→120s→240s→480s→1800s 逐级冷却 |
+| 🌐 **基础设施容错** | 网络抖动、API 502、LLM 限流 → 不扣重试次数 |
+| 📦 **容器自管理** | 自动创建 DynamicContainer，每 tick 最多 2 个容器 |
+| 🚩 **Flag 嗅探** | 扫描题目描述、附件内容、文件字符串 |
+| 💾 **救援缓存** | 提交失败的 flag 存到 `/tmp/ctf_flags_rescue.txt` |
+| 🧠 **LLM 驱动选择** | Daemon 输出菜单 → LLM 分析难度 → 写回优先级排序 |
 
 ## 精灵的成长史 · Version History
 
 | 版本 | 新能力 |
 |------|--------|
-| **v3** 🆕 | 🪞 并发分身：多槽位同时运行，`CTF_CONCURRENT_SLOTS=3` |
-| **v2.1** | 中断信号（/tmp/ctf_abort）、尝试记忆（attempt_history） |
+| **v3.1** 🆕 | LLM 驱动选择：输出 MENU → LLM 分析难度 → 写回优先顺序；平台交叉验证 |
+| **v3** | 🪞 并发分身：多槽位同时运行，`CTF_CONCURRENT_SLOTS=3` |
+| **v2.1** | 中断信号（/tmp/ctf_tasks/abort_N）、尝试记忆（attempt_history） |
 | **v2.0** | 超时放弃、退避冷却、最大重试、基础设施容错 |
 | **v1.0** | 基础精灵模式：单槽轮询 - 出题 - 收 flag |
 
@@ -206,6 +232,7 @@ LOOP:
 |---|----|----|
 | **并发** | 串行，一次一道题 | 最多 3 道题同时跑 |
 | **阻塞** | 一道卡住，其他等超时 | 一道卡住，其他照跑不误 |
+| **选择逻辑** | 硬编码排序（低分优先） | LLM 分析难度后自主选择 |
 | **任务文件** | `/tmp/ctf_task.json` | `/tmp/ctf_tasks/slot_N.json` |
 | **效率** | 等待超时才切换 | 多槽位并行推进 |
 
@@ -219,12 +246,14 @@ LOOP:
 
 | 文件 | 用途 |
 |------|------|
-| `ctf_daemon.py` | **精灵本体 v3**。60s 循环，多槽位并发管理。 |
-| `solver.py` | 一次性求解器 + 状态管理。 |
+| `ctf_daemon.py` | **精灵本体 v3.1**。60s 循环，多槽位并发管理，LLM 驱动选择。 |
+| `state.py` | 🆕 持久化状态管理（solved/retries/slots/history）。 |
+| `solver.py` | 一次性求解器 + flag 提交工具函数。 |
 | `gzctf_client.py` | GZCTF REST API —— 登录、拉题、提交。 |
 | `challenge_engine.py` | 题目分析、flag 提取、策略判断。 |
 | `submit_flag.py` | 命令行手动提交 flag。 |
 | `config.env.example` | 契约模板（复制为 config.env 并填入凭据）。 |
+| `tests/` | 🆕 测试套件（57 个测试用例）。 |
 | `/tmp/ctf_tasks/` | **v3 任务目录**：slot_N.json / flag_N.txt / abort_N |
 
 ## 许可 · License

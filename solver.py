@@ -27,6 +27,7 @@ from challenge_engine import (
     build_solving_prompt, basic_file_analysis, categorize_file,
     save_rescue_flag, load_rescue_flags, remove_rescue_flag,
 )
+from state import load_state, save_state, STATE_FILE
 
 # ── Logging ───────────────────────────────────────────────────────
 
@@ -40,45 +41,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("ctf_solver")
 
-# ── State Management ──────────────────────────────────────────────
-
-STATE_FILE = Path.home() / ".hermes" / "ctf_state.json"
-
-def load_state() -> dict:
-    """Load solver state from disk."""
-    if STATE_FILE.exists():
-        try:
-            state = json.loads(STATE_FILE.read_text())
-            # Backfill new fields for v2.1 compatibility
-            state.setdefault("retry_counts", {})
-            state.setdefault("cooldown_until", {})
-            state.setdefault("permanently_failed", {})
-            state.setdefault("task_assigned_at", None)
-            state.setdefault("attempted", {})
-            state.setdefault("failed", [])
-            state["attempt_history"] = state.setdefault("attempt_history", {})
-            state["slots"] = state.setdefault("slots", {})            # v3
-            return state
-        except Exception:
-            pass
-    return {
-        "solved": {},              # {challenge_id: flag}
-        "attempted": {},           # {challenge_id: count}
-        "failed": [],              # [challenge_id, ...]
-        "current": None,           # current challenge being worked on
-        "start_time": None,
-        "retry_counts": {},        # {challenge_id: count}
-        "cooldown_until": {},      # {challenge_id: timestamp}
-        "permanently_failed": {},  # {challenge_id: {reason, retries, at}}
-        "task_assigned_at": None,
-        "attempt_history": {},
-        "slots": {},                # v3: {"0": {"challenge_id":..., "assigned_at":...}, ...}
-    }
-
-def save_state(state: dict):
-    """Save solver state to disk."""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
 
 # ── Main Solver ────────────────────────────────────────────────────
 

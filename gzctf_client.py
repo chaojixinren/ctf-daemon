@@ -144,19 +144,29 @@ class GZCTFClient:
             urljoin(self.base_url, f"/api/game/{self.game_id}/challenges/{challenge_id}"),
             timeout=15,
         )
-        # GZCTF may return HTML for this endpoint — fall back
+        # GZCTF may return HTML for this endpoint — fall back to /details
         try:
             if resp.status_code == 200 and resp.text.strip().startswith('{'):
                 return resp.json()
         except Exception:
             pass
+
         # Fallback: get from details endpoint
+        logger.warning(
+            f"Challenge {challenge_id} endpoint returned non-JSON (%s...) — "
+            f"falling back to /details (context may be incomplete)",
+            resp.text[:50].strip()
+        )
         details = self.get_challenges()
         for cat, ch_list in details.items():
             for ch in ch_list:
                 if ch.get("id") == challenge_id:
                     ch["_category"] = cat
+                    # /details challenges may have nested context vs flat fields
+                    if "context" not in ch:
+                        ch["context"] = {}
                     return ch
+        logger.error(f"Challenge {challenge_id} not found in /details either")
         return {"id": challenge_id, "_error": "not found"}
 
     def get_all_challenge_details(self) -> List[Dict]:
