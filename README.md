@@ -1,7 +1,7 @@
-# CTF Daemon · 精灵进程
+# CTF 精灵 · Daemon
 
 > *"Daemon" — a Unix background process, and a spirit that works while you sleep.*  
-> *精灵进程：你只管睡觉，它替你解题。*
+> *你只管睡觉，精灵替你解题。*
 
 Worker-pattern autonomous CTF solver. The **精灵 (spirit)** wakes every 60 seconds,
 feeds challenges to the AI agent, collects flags, submits them — all without supervision.
@@ -9,7 +9,7 @@ feeds challenges to the AI agent, collects flags, submits them — all without s
 ```
                       ┌─────────────────────┐
                       │     CTF Daemon       │
-                      │    (精灵进程)         │
+                      │    (精灵)              │
                       │                      │
   GZCTF Platform ────▶│  wakes every 60s     │────▶ /tmp/ctf_task.json
                       │  picks next challenge │
@@ -51,8 +51,8 @@ feeds challenges to the AI agent, collects flags, submits them — all without s
 ### 1. 召唤精灵
 
 ```bash
-git clone https://github.com/chaojixinren/ctf-autosolver.git
-cd ctf-autosolver
+git clone https://github.com/chaojixinren/ctf-daemon.git
+cd ctf-daemon
 pip install requests
 ```
 
