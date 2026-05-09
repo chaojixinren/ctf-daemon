@@ -138,13 +138,26 @@ class GZCTFClient:
         return data.get("challenges", {})
 
     def get_challenge_detail(self, challenge_id: int) -> Dict:
-        """Get detailed info for a single challenge (description, hints, attachments)."""
+        """Get detailed info for a single challenge (description, hints, attachments).
+        Falls back to basic info from /details if the challenge endpoint returns HTML."""
         resp = self.session.get(
             urljoin(self.base_url, f"/api/game/{self.game_id}/challenges/{challenge_id}"),
             timeout=15,
         )
-        resp.raise_for_status()
-        return resp.json()
+        # GZCTF may return HTML for this endpoint — fall back
+        try:
+            if resp.status_code == 200 and resp.text.strip().startswith('{'):
+                return resp.json()
+        except Exception:
+            pass
+        # Fallback: get from details endpoint
+        details = self.get_challenges()
+        for cat, ch_list in details.items():
+            for ch in ch_list:
+                if ch.get("id") == challenge_id:
+                    ch["_category"] = cat
+                    return ch
+        return {"id": challenge_id, "_error": "not found"}
 
     def get_all_challenge_details(self) -> List[Dict]:
         """Get details for ALL challenges in the game."""

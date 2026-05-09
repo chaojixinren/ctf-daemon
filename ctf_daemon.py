@@ -201,23 +201,56 @@ def assigned_challenge_ids(state: dict) -> set[str]:
 # ── Failure management ─────────────────────────────────────────────
 
 def _mark_failed(state: dict, ch_id: int, reason: str, is_infra: bool):
+    """Mark a challenge as failed. NEVER permanently fail — just escalate cooldown."""
     key = str(ch_id)
     retries = state.setdefault("retry_counts", {}).get(key, 0)
     if not is_infra:
         retries += 1
         state["retry_counts"][key] = retries
-        logger.info(f"Challenge {ch_id} failed ({retries}/{MAX_RETRIES}): {reason}")
+        logger.info(f"Challenge {ch_id} failed ({retries} retries): {reason}")
     else:
         logger.info(f"Challenge {ch_id} infra failure (retry unchanged): {reason}")
 
-    if retries >= MAX_RETRIES and not is_infra:
-        state.setdefault("permanently_failed", {})[key] = {
-            "reason": reason, "retries": retries, "at": time.time(),
-        }
-        logger.warning(f"Challenge {ch_id} PERMANENTLY FAILED")
+    cooldown = _compute_cooldown(retries)
+    state.setdefault("cooldown_until", {})[key] = time.time() + cooldown
+    logger.info(f"Challenge {ch_id} cooldown: {cooldown}s")
 
-    state.setdefault("cooldown_until", {})[key] = \
-        time.time() + _compute_cooldown(retries)
+def _verify_platform_solved(client: GZCTFClient) -> dict[str, str]:
+    """Query platform to find actually-solved challenges. Returns {ch_id: flag_placeholder}."""
+    solved = {}
+    try:
+        resp = client.session.get(
+            f"{client.base_url}/api/game/{client.game_id}/details",
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            challenges = resp.json().get("challenges", {})
+            for cat, ch_list in challenges.items():
+                for ch in ch_list:
+                    if ch.get("status") == "Accepted" or ch.get("solved"):
+                        solved[str(ch["id"])] = "verified_on_platform"
+        if solved:
+            logger.info(f"Platform verified solved: {list(solved.keys())}")
+    except Exception as e:
+        logger.warning(f"Failed to verify platform solved: {e}")
+    return solved
+
+def _sync_solved_from_platform(state: dict, client: GZCTFClient):
+    """Cross-reference internal state with platform. Returns number newly discovered."""
+    platform_solved = _verify_platform_solved(client)
+    newly_discovered = 0
+    internal = state.get("solved", {})
+    for ch_id in platform_solved:
+        if ch_id not in internal:
+            internal[ch_id] = "synced_from_platform"
+            newly_discovered += 1
+            # Clean up retry/cooldown state
+            for cleanup in ("retry_counts", "cooldown_until", "attempt_history"):
+                state.get(cleanup, {}).pop(ch_id, None)
+    if newly_discovered:
+        state["solved"] = internal
+        logger.info(f"Synced {newly_discovered} challenges from platform")
+    return newly_discovered
 
 def _mark_solved(state: dict, ch_id: int, flag: str):
     key = str(ch_id)
@@ -286,8 +319,12 @@ def main():
 
     state = load_state()
     slots = slots_state(state)  # ensure initialized
+    
+    # ── Sync with platform truth ──────────────────────────────────
+    _sync_solved_from_platform(state, client)
     solved_ids = set(state["solved"].keys())
-    perm_failed = set(state.get("permanently_failed", {}).keys())
+    # No more permanent failure — keep trying forever
+    # perm_failed is kept for backward compat but not used for filtering
 
     # ── Legacy migration: if old task files exist, move to slot 0 ──
     if LEGACY_TASK.exists() and slots.get("0") is None:
@@ -325,10 +362,20 @@ def main():
         if flag:
             logger.info(f"[Slot {slot_num}] Flag: challenge {ch_id}: {flag}")
             submit_and_record(client, ch_id, flag, state)
-            _mark_solved(state, ch_id, flag)
-            _free_slot(state, slot_num)
-            save_state(state)
-            continue
+            # Verify on platform before trusting
+            _sync_solved_from_platform(state, client)
+            if str(ch_id) in state.get("solved", {}):
+                logger.info(f"[Slot {slot_num}] ✅ Verified solved: challenge {ch_id}")
+                _free_slot(state, slot_num)
+                save_state(state)
+                continue
+            else:
+                # Flag rejected — retry later
+                logger.warning(f"[Slot {slot_num}] ❌ Flag REJECTED: challenge {ch_id}")
+                _mark_failed(state, ch_id, "flag_rejected", is_infra=False)
+                _free_slot(state, slot_num)
+                save_state(state)
+                continue
 
         if elapsed > TASK_TIMEOUT:
             logger.warning(f"[Slot {slot_num}] TIMEOUT: challenge {ch_id} "
@@ -374,31 +421,80 @@ def main():
     for ch in all_challenges:
         ch_id = str(ch.get("id"))
         if ch_id in solved_ids:     continue
-        if ch_id in perm_failed:    continue
+        if False:    continue  # perm_failed removed — never give up
         if ch_id in in_flight:      continue  # already in another slot
         cooldown = state.get("cooldown_until", {}).get(ch_id, 0)
         if cooldown > now_ts:       continue
         eligible.append(ch)
 
     if not eligible and not occupied_slots(state):
-        # No slots occupied, nothing eligible — we're done
-        status_msg = (f"ALL DONE! Solved: {len(solved_ids)}/{len(all_challenges)}"
-                      f" | PermFailed: {len(perm_failed)}"
-                      f" | Cooldown: {sum(1 for _ in [])}")
-        DONE_FILE.write_text(status_msg)
-        DONE_FILE.chmod(0o644)
-        logger.info(status_msg)
-        print("DONE")
-        return
+        # Nothing eligible right now. Check if truly done or just waiting for cooldown.
+        total_challenges = len(all_challenges)
+        if len(solved_ids) >= total_challenges:
+            status_msg = f"ALL DONE! Solved: {len(solved_ids)}/{total_challenges}"
+            DONE_FILE.write_text(status_msg)
+            DONE_FILE.chmod(0o644)
+            logger.info(status_msg)
+            print("DONE")
+            return
+        else:
+            # Still waiting — cooldowns, retries, or unsolved
+            remaining = total_challenges - len(solved_ids)
+            cooldown_count = sum(1 for v in state.get("cooldown_until", {}).values() if v > now_ts)
+            print(f"WAITING:{remaining} remaining, {cooldown_count} in cooldown")
+            return
 
-    # Sort: fewer retries first, lower score first
-    eligible.sort(key=lambda ch: (
-        state.get("retry_counts", {}).get(str(ch.get("id")), 0),
-        ch.get("score", 0),
-    ))
+    # ── LLM-driven selection ─────────────────────────────────────
+    # Instead of hardcoded sorting, output a menu for the LLM to decide.
+    # The LLM (Hermes) reads this, analyzes challenges, and writes back
+    # its priority list to /tmp/ctf_selection.json
+
+    # Write menu for LLM
+    menu_lines = []
+    for ch in eligible:
+        menu_lines.append(json.dumps({
+            "id": ch.get("id"),
+            "title": ch.get("title"),
+            "category": ch.get("_category", ch.get("category", "?")),
+            "type": ch.get("type", ""),
+            "score": ch.get("score", 0),
+            "needs_container": "Container" in (ch.get("type") or ""),
+            "retries": state.get("retry_counts", {}).get(str(ch.get("id")), 0),
+            "content_preview": (ch.get("content") or "")[:300],
+        }, ensure_ascii=False))
+
+    MENU_FILE = Path("/tmp/ctf_menu.jsonl")
+    MENU_FILE.write_text("\n".join(menu_lines))
+
+    # Check if LLM already made a selection
+    SEL_FILE = Path("/tmp/ctf_selection.json")
+    if SEL_FILE.exists():
+        try:
+            sel = json.loads(SEL_FILE.read_text())
+            ordered_ids = sel.get("challenge_ids", [])
+            # Reorder eligible to match LLM's priority
+            id_to_ch = {str(ch.get("id")): ch for ch in eligible}
+            eligible = [id_to_ch[cid] for cid in ordered_ids if cid in id_to_ch]
+            logger.info(f"Using LLM selection: {ordered_ids}")
+            SEL_FILE.unlink()  # consume the selection
+        except Exception as e:
+            logger.warning(f"Failed to parse LLM selection: {e}")
+    else:
+        # No LLM selection yet — output menu and stop
+        menu_preview = "\n".join(
+            f"  [{ch.get('_category','?')}] {ch.get('title')} "
+            f"(ID:{ch.get('id')} score:{ch.get('score')} "
+            f"type:{ch.get('type','?')[:20]} retries:{state.get('retry_counts',{}).get(str(ch.get('id')),0)})"
+            for ch in eligible[:10]
+        )
+        print(f"MENU:{len(eligible)}:{menu_preview}")
+        logger.info(f"Menu written to {MENU_FILE} — waiting for LLM selection")
+        return
 
     # Fill each empty slot with the best eligible challenge
     filled = 0
+    containers_this_run = 0
+    MAX_CONTAINERS_PER_RUN = 2  # Don't spin up more than 2 containers per daemon tick
     for slot_num in free_slots:
         if not eligible:
             break
@@ -410,10 +506,20 @@ def main():
             logger.info(f"[Slot {slot_num}] Retry #{retries + 1}/{MAX_RETRIES}: "
                         f"{challenge.get('title')}")
 
+        # Container rate-limit: skip container challenges if we've hit the cap
+        is_container = "Container" in (challenge.get("type") or "")
+        if is_container and containers_this_run >= MAX_CONTAINERS_PER_RUN:
+            logger.info(f"[Slot {slot_num}] Skipping {challenge.get('title')} — "
+                        f"container limit ({MAX_CONTAINERS_PER_RUN}) reached")
+            continue
+
         # Quick flag check before dispatching
         challenge, analysis, attachments = prepare_challenge(
             client, challenge, attach_dir, state
         )
+
+        if is_container:
+            containers_this_run += 1
 
         if analysis.get("flags_found"):
             for f in analysis["flags_found"]:
