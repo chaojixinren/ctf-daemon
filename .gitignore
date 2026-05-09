@@ -1,0 +1,11 @@
+# CTF Autosolver
+
+__pycache__/
+*.pyc
+*.pyo
+config.env
+__pycache__
+/tmp/ctf_*
+.env
+*.log
+ctf_state.json
