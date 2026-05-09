@@ -1,4 +1,4 @@
-# CTF Autosolver — Autonomous GZCTF Competition Solver
+# CTF Autosolver v2.1 — Autonomous GZCTF Competition Solver
 
 > Worker-pattern CTF solver: daemon manages state, Hermes AI Agent does the solving.  
 > **No orchestration burden on the agent** — just read task → solve → write flag.
@@ -10,7 +10,7 @@
 │  CTF Daemon  │ ──────────────────────▶  │  Hermes Agent │
 │  (cron 1min) │ ◀──────────────────────  │  (AI Solver)  │
 └──────┬───────┘    /tmp/ctf_flag.txt     └──────────────┘
-       │
+       │            /tmp/ctf_abort  ←─── daemon signals agent to stop (v2.1)
        ▼
 ┌──────────────┐
 │  GZCTF API   │
@@ -19,21 +19,23 @@
 └──────────────┘
 ```
 
-- **Daemon** (`ctf_daemon.py`): Runs every 60s via cron. Handles login, challenge discovery, container creation, flag submission. Writes task files for the agent.
-- **Agent** (Hermes + Kali MCP): Reads `/tmp/ctf_task.json`, solves the challenge using 241 Kali security tools, writes flag to `/tmp/ctf_flag.txt`.
-- **State**: Persistent JSON at `~/.hermes/ctf_state.json` tracks solved, retries, cooldowns.
+- **Daemon** (`ctf_daemon.py`): Runs every 60s via cron. Login, challenge discovery, container creation, flag submission, abort signaling, attempt history tracking.
+- **Agent** (Hermes + Kali MCP): Reads `/tmp/ctf_task.json`, solves with 241 Kali tools, writes `/tmp/ctf_flag.txt`. Checks `/tmp/ctf_abort` to stop wasted work.
+- **State**: `~/.hermes/ctf_state.json` — persistent JSON with retry counts, cooldowns, attempt history.
 
-## Key Features (v2)
+## Key Features
 
-| Feature | Description |
-|---------|-------------|
-| **Non-blocking** | Timeout per task (default 600s). Stuck challenge → skip to next. |
-| **Retry + Cooldown** | Escalating backoff: 60s → 120s → 240s → 480s → Max 1800s. |
-| **Max Retries** | After 4 attempts, permanently skip the challenge. |
-| **Infra Failure Detection** | Network/API/LLM errors don't consume retry count. |
-| **DynamicContainer Support** | Auto-creates containers, waits 60s for readiness, re-fetches instance entry. |
-| **Auto Flag Detection** | Scans descriptions, attachments, and file strings for flags. |
-| **Rescue Cache** | Failed submissions cached to `/tmp/ctf_flags_rescue.txt` for retry. |
+| Feature | v2.1 | Description |
+|---------|------|-------------|
+| **Non-blocking** | ✅ | Timeout per task (600s). Stuck → auto-abort → next challenge. |
+| **Abort Signal** | ✅ 🆕 | `/tmp/ctf_abort` tells the agent to stop wasted work immediately. |
+| **Attempt History** | ✅ 🆕 | Tracks what was tried. Injected into task on retry — agent learns from failures. |
+| **Retry + Cooldown** | ✅ | Escalating backoff: 60s→120s→240s→480s→1800s max. |
+| **Max Retries** | ✅ | After 4 attempts, permanently skip. |
+| **Infra Failure Detection** | ✅ | Network/LLM errors don't consume retry count. |
+| **DynamicContainer** | ✅ | Auto-create containers, wait 60s, re-fetch instance entry. |
+| **Auto Flag Detection** | ✅ | Scans descriptions, attachments, file strings. |
+| **Rescue Cache** | ✅ | Failed submissions saved to `/tmp/ctf_flags_rescue.txt` for retry. |
 
 ## Quick Start
 
@@ -41,7 +43,7 @@
 
 - Python 3.10+
 - Hermes Agent with Kali MCP Server
-- Access to a GZCTF competition platform
+- GZCTF competition platform access
 
 ### 2. Install
 
@@ -53,8 +55,6 @@ pip install requests
 
 ### 3. Configure
 
-Copy and edit the config:
-
 ```bash
 cp config.env.example config.env
 ```
@@ -65,11 +65,11 @@ Edit `config.env`:
 GZCTF_BASE_URL=http://your-gzctf-server:8080
 GZCTF_USERNAME=your_username
 GZCTF_PASSWORD=your_password
-GZCTF_GAME_ID=0          # 0 = auto-discover first available game
+GZCTF_GAME_ID=0          # 0 = auto-discover
 GZCTF_TEAM_NAME=AI_Solver
 ATTACHMENT_DIR=/tmp/ctf_attachments
 
-# Daemon v2 controls
+# Daemon v2.1 controls
 CTF_TASK_TIMEOUT_SECONDS=600      # Abandon task after 10 min
 CTF_MAX_RETRIES_PER_CHALLENGE=4   # Max retries before permanent skip
 CTF_BASE_RETRY_COOLDOWN=60        # Base cooldown (escalates 2x per retry)
@@ -79,10 +79,10 @@ CTF_MAX_RETRY_COOLDOWN=1800       # Max cooldown ceiling (30 min)
 ### 4. Deploy with Cron
 
 ```bash
-# Run daemon every 60 seconds
+# Standard cron
 (crontab -l 2>/dev/null; echo "* * * * * cd $(pwd) && python3 ctf_daemon.py >> /tmp/ctf_daemon.log 2>&1") | crontab -
 
-# Or via Hermes cronjob
+# Or via Hermes
 hermes cronjob create \
   --name "CTF Daemon Safety Net" \
   --schedule "every 1m" \
@@ -93,39 +93,43 @@ hermes cronjob create \
 ### 5. Manual Usage
 
 ```bash
-# Run daemon once (writes task file if agent is idle)
-python3 ctf_daemon.py
-
-# Check solver status
-python3 solver.py status
-
-# List all challenges
-python3 solver.py list
-
-# Submit a flag manually
-python3 submit_flag.py <challenge_id> "flag{...}"
+python3 ctf_daemon.py              # Run once (writes task or processes flags)
+python3 solver.py status           # View state
+python3 solver.py list             # List challenges
+python3 submit_flag.py <id> "flag{...}"  # Manual submission
 ```
 
-## How the Agent Solves
+## How the Agent Solves (v2.1 Loop)
 
-When the daemon writes `/tmp/ctf_task.json`, the Hermes Agent:
+```
+LOOP:
+  1. execute_code → run ctf_daemon.py
+     → "TASK:id:category:title"  (solved!)
+     → "ABORT:id:reason:elapsed" (TIMEOUT — stop current work!)
+     → "PENDING:id:elapsed"      (agent busy, wait)
+     → "DONE"                    (all solved, STOP)
 
-1. Reads the task file (challenge ID, category, strategy, tools, container entry)
-2. Loads the `ctf-autosolver` skill for context
-3. Uses Kali MCP tools (`nmap`, `sqlmap`, `nuclei`, `gobuster`, `pwnpasi`, etc.)
-4. Writes discovered flags to `/tmp/ctf_flag.txt`
+  2. Check /tmp/ctf_abort first — if daemon aborted, don't read old task
 
-The daemon picks up the flag on its next tick and submits it via the GZCTF API.
+  3. read_file /tmp/ctf_task.json
+     → retry_number, attempt_history (learn from past failures!)
 
-## Daemon v2 vs v1: What Changed
+  4. Solve with Kali MCP tools (nmap, sqlmap, nuclei, gobuster, pwnpasi...)
 
-| | v1 | v2 |
-|---|---|---|
-| **Blocking** | One task stuck → everything blocked | Timeout → skip → next challenge |
-| **Retry** | None | Escalating backoff with cooldown |
-| **Max Retries** | None | 4 permanent skip |
-| **Infra Failure** | Counts as real failure | Detected, retry count unchanged |
-| **State** | `{solved, attempted, failed}` | `+ {retry_counts, cooldown_until, permanently_failed, task_assigned_at}` |
+  5. Periodically check /tmp/ctf_abort — stop immediately if it appears
+
+  6. write_file /tmp/ctf_flag.txt with the flag
+
+  7. GOTO 1
+```
+
+## Version History
+
+| Version | Changes |
+|---------|---------|
+| **v2.1** | Abort signaling, attempt history, machine-readable output |
+| **v2.0** | Non-blocking timeout, retry cooldown, max retries, infra failure detection |
+| **v1.0** | Basic daemon-worker pattern, sequential single-task locking |
 
 Inspired by [LingXi](https://github.com/chaojixinren/LingXi)'s concurrent task model.
 
@@ -133,10 +137,10 @@ Inspired by [LingXi](https://github.com/chaojixinren/LingXi)'s concurrent task m
 
 | File | Purpose |
 |------|---------|
-| `ctf_daemon.py` | Background orchestrator. Called by cron every 60s. |
-| `solver.py` | One-shot solver entry. Can also be run manually. |
+| `ctf_daemon.py` | Background orchestrator (v2.1). Cron every 60s. |
+| `solver.py` | One-shot solver + state management. |
 | `gzctf_client.py` | GZCTF REST API client (login, fetch, submit). |
-| `challenge_engine.py` | Challenge analysis, flag extraction, strategy detection. |
+| `challenge_engine.py` | Analysis, flag extraction, strategy detection. |
 | `submit_flag.py` | CLI for manual flag submission. |
 | `config.env.example` | Configuration template. |
 

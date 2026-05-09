@@ -49,13 +49,14 @@ def load_state() -> dict:
     if STATE_FILE.exists():
         try:
             state = json.loads(STATE_FILE.read_text())
-            # Backfill new fields for v2 compatibility
+            # Backfill new fields for v2.1 compatibility
             state.setdefault("retry_counts", {})
             state.setdefault("cooldown_until", {})
             state.setdefault("permanently_failed", {})
             state.setdefault("task_assigned_at", None)
             state.setdefault("attempted", {})
             state.setdefault("failed", [])
+            state.setdefault("attempt_history", {})      # v2.1
             return state
         except Exception:
             pass
@@ -65,10 +66,11 @@ def load_state() -> dict:
         "failed": [],              # [challenge_id, ...]
         "current": None,           # current challenge being worked on
         "start_time": None,
-        "retry_counts": {},        # {challenge_id: count} — v2: per-challenge retries
-        "cooldown_until": {},      # {challenge_id: timestamp} — v2: cooldown deadline
-        "permanently_failed": {},  # {challenge_id: {reason, retries, at}} — v2: give-up list
-        "task_assigned_at": None,  # v2: unix timestamp when current task was dispatched
+        "retry_counts": {},        # {challenge_id: count}
+        "cooldown_until": {},      # {challenge_id: timestamp}
+        "permanently_failed": {},  # {challenge_id: {reason, retries, at}}
+        "task_assigned_at": None,  # unix timestamp
+        "attempt_history": {},     # v2.1: {challenge_id: [{attempt, at, summary, tools_used, error}]}
     }
 
 def save_state(state: dict):
