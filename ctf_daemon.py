@@ -321,6 +321,67 @@ def prepare_challenge(client: GZCTFClient, challenge: dict,
     analysis = ChallengeAnalyzer.analyze_challenge(challenge)
     return challenge, analysis, attachments, wd
 
+# ── Container health monitoring (v3.4) ─────────────────────────────
+
+def _check_container_health(state: dict):
+    """Check all occupied container slots for liveness. Dead containers → abort slot.
+    Retries 3 times with 1s delay between attempts to avoid transient failures."""
+    import socket
+
+    for slot_num, slot_data in occupied_slots(state).items():
+        ch_id = slot_data["challenge_id"]
+        tf = task_file(slot_num)
+        if not tf.exists():
+            continue
+
+        try:
+            task = json.loads(tf.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        container_entry = task.get("container_entry")
+        if not container_entry:
+            continue  # no container to check
+
+        # Parse host:port — container_entry is "172.19.0.3:32771"
+        try:
+            host, port_str = container_entry.rsplit(":", 1)
+            port = int(port_str)
+        except (ValueError, TypeError):
+            logger.warning(f"[Slot {slot_num}] Bad container_entry: {container_entry}")
+            continue
+
+        # Retry up to 3 times with 1s delay
+        alive = False
+        for attempt in range(1, 4):
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect((host, port))
+                sock.close()
+                alive = True
+                break
+            except (socket.error, OSError):
+                if attempt < 3:
+                    time.sleep(1)
+
+        if alive:
+            continue  # container is healthy
+
+        # Container dead after 3 retries
+        elapsed = time.time() - slot_data.get("assigned_at", 0)
+        logger.warning(
+            f"[Slot {slot_num}] 💀 Container DEAD: challenge {ch_id} "
+            f"({host}:{port}) after {elapsed:.0f}s"
+        )
+        record_attempt(state, ch_id,
+                       summary=f"Container died at {host}:{port} after {elapsed:.0f}s")
+        _mark_failed(state, ch_id, f"container_died ({host}:{port})", is_infra=True)
+        signal_abort(slot_num, ch_id, f"Container unreachable: {host}:{port}")
+        _free_slot(state, slot_num)
+        save_state(state)
+        logger.info(f"[Slot {slot_num}] Freed — container dead → cooldown (no retry penalty)")
+
 # ── Main ───────────────────────────────────────────────────────────
 
 def main():
@@ -438,6 +499,9 @@ def main():
         # Task in progress — keep it
         logger.info(f"[Slot {slot_num}] Running: challenge {ch_id} "
                     f"({elapsed:.0f}s/{TASK_TIMEOUT}s)")
+
+    # ── Step 1.5: Container health check ───────────────────────────
+    _check_container_health(state)
 
     # ── Step 2: Fill empty slots ───────────────────────────────────
 
