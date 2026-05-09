@@ -243,11 +243,9 @@ LOOP:
 **命名规则**：题目名 → 小写 + 特殊字符转下划线 + `_{id}` 后缀保证唯一
 | 题目名 | 目录名 |
 |--------|--------|
-| `Ez_DSA` (ID:4) | `/tmp/ctf_ez_dsa_4/` |
-| `BY_Caesar` (ID:2) | `/tmp/ctf_by_caesar_2/` |
-| `CGI` (ID:15) | `/tmp/ctf_cgi_15/` |
-| `writeup_channel` (ID:20) | `/tmp/ctf_writeup_channel_20/` |
-| `!!! test !!!` (ID:99) | `/tmp/ctf_test_99/` |
+| `Hello_World` (ID:1) | `/tmp/ctf_hello_world_1/` |
+| `Flag_Checker` (ID:2) | `/tmp/ctf_flag_checker_2/` |
+| `!!! welcome !!!` (ID:3) | `/tmp/ctf_welcome_3/` |
 
 ## 精灵的成长史 · Version History
 
