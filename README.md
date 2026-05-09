@@ -1,4 +1,4 @@
-# CTF 精灵 · Daemon v3.4
+# CTF 精灵 · Daemon v3.4.4
 
 > *"Daemon" — a Unix background process, and a spirit that works while you sleep.*  
 > *你只管睡觉，精灵替你解题。精灵学会了分身术+搬家术，每道题有独立的家。*
@@ -7,6 +7,7 @@ Worker-pattern autonomous CTF solver. The **精灵 (spirit)** wakes every 60 sec
 fills up to 3 concurrent challenge slots, collects flags from all, submits them — 
 all without supervision. **v3.4 adds per-challenge isolated workdirs** — no more
 file confusion when 19 challenges dump attachments into one folder.
+**v3.4.4 fixes pure-Chinese title collision** — challenges with titles that sanitize to the same string (e.g. all-Chinese names) now get unique workdirs via `_{id}` suffix.
 
 ```
                       ┌──────────────────────────────────────┐
@@ -239,20 +240,20 @@ LOOP:
 └── abort_0
 ```
 
-**命名规则**：题目名 → 小写 + 特殊字符转下划线
+**命名规则**：题目名 → 小写 + 特殊字符转下划线 + `_{id}` 后缀保证唯一
 | 题目名 | 目录名 |
 |--------|--------|
-| `Ez_DSA` | `/tmp/ctf_ez_dsa/` |
-| `BY_Caesar` | `/tmp/ctf_by_caesar/` |
-| `CGI` | `/tmp/ctf_cgi/` |
-| `writeup_channel` | `/tmp/ctf_writeup_channel/` |
-| `!!! test !!!` | `/tmp/ctf_test/` |
+| `Ez_DSA` (ID:4) | `/tmp/ctf_ez_dsa_4/` |
+| `BY_Caesar` (ID:2) | `/tmp/ctf_by_caesar_2/` |
+| `CGI` (ID:15) | `/tmp/ctf_cgi_15/` |
+| `writeup_channel` (ID:20) | `/tmp/ctf_writeup_channel_20/` |
+| `!!! test !!!` (ID:99) | `/tmp/ctf_test_99/` |
 
 ## 精灵的成长史 · Version History
 
 | 版本 | 新能力 |
 |------|--------|
-| **v3.4** 🆕 | 📁 目录隔离 + 📦 容器全生命周期：创建/续期(>30min)/健康检查(TCP×3)/自动删除，死容器 6s 检测无残留 |
+| **v3.4.4** | 🐛 纯中文标题碰撞修复：sanitize 后同名的题目通过 `_{id}` 后缀获得独立工作目录，不再冲突 |
 | **v3.3** | 平台交叉验证、永不放弃（移除 permanent_failed）、ID 漂移检测 |
 | **v3.2** | LLM 驱动选择：输出 MENU → LLM 分析难度 → 写回优先顺序 |
 | **v3.1** | 并发分身：多槽位同时运行，`CTF_CONCURRENT_SLOTS=3` |

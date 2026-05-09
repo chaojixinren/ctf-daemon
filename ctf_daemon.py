@@ -92,10 +92,13 @@ def sanitize_title(title: str) -> str:
     safe = safe.strip('_')
     return safe or "challenge"
 
-def challenge_workdir(title: str) -> Path:
-    """Get/create per-challenge isolated workdir: /tmp/ctf_{sanitized_title}/"""
+def challenge_workdir(title: str, ch_id: int = 0) -> Path:
+    """Get/create per-challenge isolated workdir: /tmp/ctf_{sanitized_title}_{id}/
+    ch_id ensures uniqueness even when sanitize_title produces collisions (e.g. pure Chinese titles)."""
     base = Path(os.environ.get("CTF_WORKDIR_BASE", str(WORKDIR_BASE)))
-    wd = base / f"ctf_{sanitize_title(title)}"
+    safe = sanitize_title(title)
+    suffix = f"_{ch_id}" if ch_id else ""
+    wd = base / f"ctf_{safe}{suffix}"
     wd.mkdir(parents=True, exist_ok=True)
     return wd
 
@@ -320,7 +323,7 @@ def prepare_challenge(client: GZCTFClient, challenge: dict,
         except Exception as e:
             logger.warning(f"Failed to fetch detail for {ch_id}: {e}")
 
-    wd = workdir if workdir else challenge_workdir(title)
+    wd = workdir if workdir else challenge_workdir(title, ch_id)
     attachments = client.download_challenge_attachments(challenge, str(wd))
 
     if challenge.get("type") == "DynamicContainer":
@@ -664,7 +667,7 @@ def main():
             continue
 
         # Quick flag check before dispatching
-        wd = challenge_workdir(challenge.get("title") or f"challenge_{ch_id}")
+        wd = challenge_workdir(challenge.get("title") or f"challenge_{ch_id}", ch_id)
         challenge, analysis, attachments, wd = prepare_challenge(
             client, challenge, wd, state
         )
