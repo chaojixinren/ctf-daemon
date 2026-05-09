@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """
-CTF Daemon v2.1 — Non-blocking orchestrator with abort signaling and attempt history.
-Inspired by LingXi's concurrent task model.
+CTF Daemon v3 — Multi-slot concurrent orchestrator.
+             精灵学会了分身术，同时处理多道题目。
 
-Key features:
-  1. TASK_TIMEOUT:  Agent stuck → auto-abort → next challenge.
-  2. ABORT SIGNAL:  Writes /tmp/ctf_abort so agent knows to stop immediately.
-  3. RETRY_COOLDOWN: Escalating backoff per challenge (60s→120s→240s→480s→1800s).
-  4. MAX_RETRIES:   After N failures, permanently skip.
-  5. INFRA_FAILURE: Network/LLM errors don't consume retry count.
-  6. ATTEMPT_HISTORY: Tracks what was tried, injected into task on retry.
-  7. MACHINE-READABLE OUTPUT: TASK: / PENDING: / ABORT: / DONE for agent loop.
+Each "slot" is an independent challenge pipeline. The daemon fills empty 
+slots with eligible challenges, collects flags from all slots, and aborts 
+stuck ones individually — without blocking other slots.
+
+Slot files:
+  /tmp/ctf_tasks/
+    slot_0.json   → challenge for slot 0
+    slot_1.json   → challenge for slot 1
+    slot_2.json   → challenge for slot 2
+    flag_0.txt    → flag found in slot 0
+    flag_1.txt    → flag found in slot 1
+    flag_2.txt    → flag found in slot 2
+    abort_0       → abort signal for slot 0
+    abort_1       → abort signal for slot 1
+    abort_2       → abort signal for slot 2
+
+Backward compatible: CTF_CONCURRENT_SLOTS=1 behaves identically to v2.1.
 """
 
 import os, sys, json, time, logging
@@ -27,27 +36,33 @@ logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                     format="%(asctime)s [daemon] %(message)s")
 logger = logging.getLogger("ctf_daemon")
 
-TASK_FILE   = Path("/tmp/ctf_task.json")
-FLAG_FILE   = Path("/tmp/ctf_flag.txt")
-ANSWER_FILE = Path("/tmp/ctf_answer.json")
-DONE_FILE   = Path("/tmp/ctf_done")
-ABORT_FILE  = Path("/tmp/ctf_abort")       # v2.1: signals agent to stop
+# ── Slots ──────────────────────────────────────────────────────────
 
-# ── Configurable knobs ─────────────────────────────────────────────
+TASKS_DIR  = Path("/tmp/ctf_tasks")
+DONE_FILE  = Path("/tmp/ctf_done")
+LEGACY_TASK = Path("/tmp/ctf_task.json")   # v2 compatibility
+LEGACY_FLAG = Path("/tmp/ctf_flag.txt")
 
-def _cfg_seconds(env_var: str, default: int) -> int:
+def _cfg_int(env_var: str, default: int) -> int:
     val = os.environ.get(env_var, "").strip()
-    try:
-        return max(1, int(val)) if val else default
-    except ValueError:
-        return default
+    try: return max(1, int(val)) if val else default
+    except ValueError: return default
 
-TASK_TIMEOUT  = _cfg_seconds("CTF_TASK_TIMEOUT_SECONDS", 600)
-MAX_RETRIES   = _cfg_seconds("CTF_MAX_RETRIES_PER_CHALLENGE", 4)
-BASE_COOLDOWN = _cfg_seconds("CTF_BASE_RETRY_COOLDOWN", 60)
-MAX_COOLDOWN  = _cfg_seconds("CTF_MAX_RETRY_COOLDOWN", 1800)
+MAX_SLOTS     = _cfg_int("CTF_CONCURRENT_SLOTS", 3)
+TASK_TIMEOUT  = _cfg_int("CTF_TASK_TIMEOUT_SECONDS", 600)
+MAX_RETRIES   = _cfg_int("CTF_MAX_RETRIES_PER_CHALLENGE", 4)
+BASE_COOLDOWN = _cfg_int("CTF_BASE_RETRY_COOLDOWN", 60)
+MAX_COOLDOWN  = _cfg_int("CTF_MAX_RETRY_COOLDOWN", 1800)
 
-# ── Infra failure keywords ─────────────────────────────────────────
+def slot_dir() -> Path:
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    return TASKS_DIR
+
+def task_file(slot: int) -> Path:      return slot_dir() / f"slot_{slot}.json"
+def flag_file(slot: int) -> Path:      return slot_dir() / f"flag_{slot}.txt"
+def abort_file(slot: int) -> Path:     return slot_dir() / f"abort_{slot}"
+
+# ── Infra failure detection ────────────────────────────────────────
 
 INFRA_FAILURE_KEYWORDS = (
     "connection reset", "connection refused", "connection aborted",
@@ -68,61 +83,48 @@ def _compute_cooldown(retry_count: int) -> int:
 
 # ── Abort signaling ────────────────────────────────────────────────
 
-def signal_abort(challenge_id: int, reason: str = "timeout"):
-    """Write /tmp/ctf_abort so the agent loop knows to stop."""
-    ABORT_FILE.write_text(json.dumps({
-        "challenge_id": challenge_id,
-        "reason": reason,
-        "at": time.time(),
+def signal_abort(slot: int, challenge_id: int, reason: str = "timeout"):
+    abort_file(slot).write_text(json.dumps({
+        "slot": slot, "challenge_id": challenge_id,
+        "reason": reason, "at": time.time(),
     }))
-    logger.info(f"ABORT signal sent for challenge {challenge_id}: {reason}")
+    logger.info(f"[Slot {slot}] ABORT signal for challenge {challenge_id}: {reason}")
 
-def clear_abort():
-    if ABORT_FILE.exists():
-        ABORT_FILE.unlink()
+def clear_abort(slot: int):
+    f = abort_file(slot)
+    if f.exists(): f.unlink()
 
-def check_abort() -> dict | None:
-    """Check if abort was signaled. Returns None if no abort pending."""
-    if ABORT_FILE.exists():
-        try:
-            return json.loads(ABORT_FILE.read_text())
-        except Exception:
-            pass
+def check_abort(slot: int) -> dict | None:
+    f = abort_file(slot)
+    if f.exists():
+        try: return json.loads(f.read_text())
+        except: pass
     return None
 
 # ── Attempt history ────────────────────────────────────────────────
 
 def record_attempt(state: dict, challenge_id: int, summary: str = "",
                    tools_used: list = None, error: str = ""):
-    """Save what was tried for this challenge attempt."""
     key = str(challenge_id)
     history = state.setdefault("attempt_history", {}).setdefault(key, [])
     entry = {
-        "attempt": len(history) + 1,
-        "at": time.time(),
+        "attempt": len(history) + 1, "at": time.time(),
         "summary": summary[:500] if summary else "",
         "tools_used": (tools_used or [])[:10],
         "error": error[:300] if error else "",
     }
     history.append(entry)
-    # Keep only last 10 attempts
     if len(history) > 10:
         state["attempt_history"][key] = history[-10:]
 
 def get_attempt_history(state: dict, challenge_id: int) -> list:
-    """Get previous attempt history for retry context."""
-    key = str(challenge_id)
-    return state.get("attempt_history", {}).get(key, [])
+    return state.get("attempt_history", {}).get(str(challenge_id), [])
 
 def format_history_for_agent(history: list) -> str:
-    """Format attempt history as human-readable hints for the agent."""
-    if not history:
-        return ""
+    if not history: return ""
     lines = ["", "## Previous Attempts (learn from these)", ""]
     for entry in history:
-        lines.append(
-            f"- Attempt {entry['attempt']}: {entry['summary']}"
-        )
+        lines.append(f"- Attempt {entry['attempt']}: {entry['summary']}")
         if entry.get("tools_used"):
             lines.append(f"  Tools tried: {', '.join(entry['tools_used'][:5])}")
         if entry.get("error"):
@@ -133,9 +135,10 @@ def format_history_for_agent(history: list) -> str:
 # ── Task I/O ───────────────────────────────────────────────────────
 
 def write_task(challenge: dict, analysis: dict, attachments: list,
-               state: dict = None):
-    """Write task file with retry context and attempt history."""
+               state: dict = None, slot: int = 0):
+    """Write task to a specific slot."""
     task = {
+        "slot": slot,
         "challenge_id": challenge.get("id"),
         "title": challenge.get("title"),
         "category": challenge.get("_category"),
@@ -150,40 +153,56 @@ def write_task(challenge: dict, analysis: dict, attachments: list,
         "attachments": attachments,
         "context_file": str(analysis.get("attachment_url") or ""),
         "assigned_at": time.time(),
-        # v2.1: retry context
         "retry_number": state.get("retry_counts", {}).get(str(challenge.get("id")), 0) if state else 0,
         "attempt_history": format_history_for_agent(
             get_attempt_history(state, challenge.get("id", 0))
         ) if state else "",
     }
-    TASK_FILE.write_text(json.dumps(task, indent=2, ensure_ascii=False))
-    logger.info(f"Task written: [{challenge.get('_category')}] {challenge.get('title')} "
-                f"(ID:{challenge.get('id')}, retry #{task['retry_number']})")
+    task_file(slot).write_text(json.dumps(task, indent=2, ensure_ascii=False))
+    logger.info(f"[Slot {slot}] Task: [{challenge.get('_category')}] "
+                f"{challenge.get('title')} (ID:{challenge.get('id')})")
 
-def read_flag() -> str | None:
-    if FLAG_FILE.exists():
-        flag = FLAG_FILE.read_text().strip()
+def read_flag(slot: int) -> str | None:
+    f = flag_file(slot)
+    if f.exists():
+        flag = f.read_text().strip()
         if flag:
-            FLAG_FILE.unlink()
+            f.unlink()
             return flag
     return None
 
-def read_answer() -> dict | None:
-    if ANSWER_FILE.exists():
-        try:
-            data = json.loads(ANSWER_FILE.read_text())
-            ANSWER_FILE.unlink()
-            return data
-        except Exception:
-            pass
-    return None
+# ── State / slot management ────────────────────────────────────────
+
+def slots_state(state: dict) -> dict:
+    """Get or initialize the slots state dict."""
+    s = state.setdefault("slots", {})
+    # Ensure all slots 0..MAX_SLOTS-1 exist
+    for i in range(MAX_SLOTS):
+        if str(i) not in s:
+            s[str(i)] = None  # None = empty
+    return s
+
+def occupied_slots(state: dict) -> dict[int, dict]:
+    """Return {slot_num: slot_data} for occupied slots."""
+    result = {}
+    for k, v in slots_state(state).items():
+        if v is not None:
+            result[int(k)] = v
+    return result
+
+def empty_slots(state: dict) -> list[int]:
+    """Return list of empty slot numbers."""
+    return [int(k) for k, v in slots_state(state).items() if v is None]
+
+def assigned_challenge_ids(state: dict) -> set[str]:
+    """All challenge IDs currently assigned to slots."""
+    return {str(v["challenge_id"]) for v in slots_state(state).values() if v}
 
 # ── Failure management ─────────────────────────────────────────────
 
-def _mark_challenge_failed(state: dict, ch_id: int, reason: str, is_infra: bool):
+def _mark_failed(state: dict, ch_id: int, reason: str, is_infra: bool):
     key = str(ch_id)
     retries = state.setdefault("retry_counts", {}).get(key, 0)
-
     if not is_infra:
         retries += 1
         state["retry_counts"][key] = retries
@@ -195,32 +214,56 @@ def _mark_challenge_failed(state: dict, ch_id: int, reason: str, is_infra: bool)
         state.setdefault("permanently_failed", {})[key] = {
             "reason": reason, "retries": retries, "at": time.time(),
         }
-        logger.warning(f"Challenge {ch_id} PERMANENTLY FAILED after {retries} retries")
+        logger.warning(f"Challenge {ch_id} PERMANENTLY FAILED")
 
-    cooldown = _compute_cooldown(retries)
-    state.setdefault("cooldown_until", {})[key] = time.time() + cooldown
-
+    state.setdefault("cooldown_until", {})[key] = \
+        time.time() + _compute_cooldown(retries)
 
 def _mark_solved(state: dict, ch_id: int, flag: str):
-    """Clean up all failure state for a solved challenge."""
     key = str(ch_id)
     state["solved"][key] = flag
-    state.get("retry_counts", {}).pop(key, None)
-    state.get("cooldown_until", {}).pop(key, None)
-    state.get("permanently_failed", {}).pop(key, None)
-    state.get("attempt_history", {}).pop(key, None)
-    state["current"] = None
-    state.pop("task_assigned_at", None)
+    for cleanup in ("retry_counts", "cooldown_until", "permanently_failed", "attempt_history"):
+        state.get(cleanup, {}).pop(key, None)
 
-# ── Main loop ──────────────────────────────────────────────────────
+def _free_slot(state: dict, slot: int):
+    """Release a slot back to the pool."""
+    slots_state(state)[str(slot)] = None
+    clear_abort(slot)
+    f = task_file(slot)
+    if f.exists(): f.unlink()
+
+# ── Challenge preparation ──────────────────────────────────────────
+
+def prepare_challenge(client: GZCTFClient, challenge: dict,
+                      attachment_dir: str, state: dict = None) -> tuple:
+    """Prepare a challenge: attachments, container, analysis. Returns (challenge, analysis, attachments)."""
+    ch_id = challenge["id"]
+    attachments = client.download_challenge_attachments(challenge, attachment_dir)
+
+    if challenge.get("type") == "DynamicContainer":
+        logger.info(f"Creating container for challenge {ch_id}...")
+        try:
+            client.create_container(ch_id)
+            if client.wait_for_container_ready(ch_id, timeout=60):
+                challenge = client.get_challenge_detail(ch_id)
+                logger.info(f"Container ready: challenge {ch_id}")
+            else:
+                logger.warning(f"Container not ready: challenge {ch_id}")
+        except Exception as e:
+            logger.warning(f"Container creation failed for {ch_id}: {e}")
+
+    analysis = ChallengeAnalyzer.analyze_challenge(challenge)
+    return challenge, analysis, attachments
+
+# ── Main ───────────────────────────────────────────────────────────
 
 def main():
     config = load_config(str(SCRIPT_DIR / "config.env"))
-    base_url = config.get("GZCTF_BASE_URL", "")
-    username = config.get("GZCTF_USERNAME", "")
-    password = config.get("GZCTF_PASSWORD", "")
-    game_id = int(config.get("GZCTF_GAME_ID", "0"))
-    attachment_dir = config.get("ATTACHMENT_DIR", "/tmp/ctf_attachments")
+    base_url    = config.get("GZCTF_BASE_URL", "")
+    username    = config.get("GZCTF_USERNAME", "")
+    password    = config.get("GZCTF_PASSWORD", "")
+    game_id     = int(config.get("GZCTF_GAME_ID", "0"))
+    attach_dir  = config.get("ATTACHMENT_DIR", "/tmp/ctf_attachments")
 
     if not base_url or not username or not password:
         logger.error("Missing credentials in config.env")
@@ -242,114 +285,105 @@ def main():
     client.get_game_detail(game_id)
 
     state = load_state()
+    slots = slots_state(state)  # ensure initialized
     solved_ids = set(state["solved"].keys())
     perm_failed = set(state.get("permanently_failed", {}).keys())
 
-    # ── Step 1: Process completed/aborted tasks ─────────────────────
+    # ── Legacy migration: if old task files exist, move to slot 0 ──
+    if LEGACY_TASK.exists() and slots.get("0") is None:
+        try:
+            legacy_task = json.loads(LEGACY_TASK.read_text())
+            ch_id = legacy_task.get("challenge_id")
+            if ch_id:
+                slots["0"] = {
+                    "challenge_id": ch_id,
+                    "assigned_at": legacy_task.get("assigned_at", time.time()),
+                }
+                # Copy to slot task file
+                task_file(0).write_text(LEGACY_TASK.read_text())
+                LEGACY_TASK.unlink()
+                logger.info(f"Migrated legacy task to slot 0: challenge {ch_id}")
+        except Exception:
+            if LEGACY_TASK.exists(): LEGACY_TASK.unlink()
 
-    flag = read_flag()
-    answer = read_answer()
-    current_ch_id = state.get("current")
-
-    if current_ch_id:
-        task_assigned_at = state.get("task_assigned_at", 0)
-        elapsed = time.time() - task_assigned_at if task_assigned_at else 0
-
+    if LEGACY_FLAG.exists():
+        flag = LEGACY_FLAG.read_text().strip()
         if flag:
-            logger.info(f"Flag received: challenge {current_ch_id}: {flag}")
-            submit_and_record(client, current_ch_id, flag, state)
-            _mark_solved(state, current_ch_id, flag)
-            clear_abort()
-            if TASK_FILE.exists():
-                TASK_FILE.unlink()
+            flag_file(0).write_text(flag)
+            LEGACY_FLAG.unlink()
+            logger.info("Migrated legacy flag to slot 0")
+
+    # ── Step 1: Process completed/aborted slots ─────────────────────
+
+    for slot_num, slot_data in occupied_slots(state).items():
+        ch_id = slot_data["challenge_id"]
+        assigned_at = slot_data.get("assigned_at", 0)
+        elapsed = time.time() - assigned_at if assigned_at else 0
+
+        flag = read_flag(slot_num)
+        if flag:
+            logger.info(f"[Slot {slot_num}] Flag: challenge {ch_id}: {flag}")
+            submit_and_record(client, ch_id, flag, state)
+            _mark_solved(state, ch_id, flag)
+            _free_slot(state, slot_num)
             save_state(state)
+            continue
 
-        elif answer:
-            logger.info(f"Answer received: {json.dumps(answer, ensure_ascii=False)[:200]}")
-            if answer.get("success"):
-                for f in answer.get("flags", []):
-                    submit_and_record(client, current_ch_id, f, state)
-            _mark_solved(state, current_ch_id, answer.get("flags", [""])[0])
-            clear_abort()
-            if TASK_FILE.exists():
-                TASK_FILE.unlink()
-            save_state(state)
-
-        elif elapsed > TASK_TIMEOUT:
-            # ── TIMEOUT: abort signal + fail + move on ─────────────
-            logger.warning(f"TIMEOUT: challenge {current_ch_id} after {elapsed:.0f}s "
-                           f"(limit: {TASK_TIMEOUT}s)")
-
-            # Check if task file hints at infra failure
+        if elapsed > TASK_TIMEOUT:
+            logger.warning(f"[Slot {slot_num}] TIMEOUT: challenge {ch_id} "
+                           f"after {elapsed:.0f}s")
             is_infra = False
-            if TASK_FILE.exists():
+            tf = task_file(slot_num)
+            if tf.exists():
                 try:
-                    task = json.loads(TASK_FILE.read_text())
+                    task = json.loads(tf.read_text())
                     is_infra = _is_infra_failure(task.get("description", ""))
-                except Exception:
-                    pass
+                except: pass
 
-            # Record attempt with timeout info
-            record_attempt(state, current_ch_id,
+            record_attempt(state, ch_id,
                           summary=f"Timeout after {elapsed:.0f}s",
                           error=f"Exceeded TASK_TIMEOUT ({TASK_TIMEOUT}s)")
-
-            _mark_challenge_failed(state, current_ch_id,
-                                   f"timeout after {elapsed:.0f}s", is_infra)
-
-            # Send abort signal so agent stops working on this
-            signal_abort(current_ch_id, f"timeout ({elapsed:.0f}s)")
-
-            state["current"] = None
-            state.pop("task_assigned_at", None)
+            _mark_failed(state, ch_id, f"timeout ({elapsed:.0f}s)", is_infra)
+            signal_abort(slot_num, ch_id, f"timeout ({elapsed:.0f}s)")
+            _free_slot(state, slot_num)
             save_state(state)
-            if TASK_FILE.exists():
-                TASK_FILE.unlink()
-            print(f"ABORT:{current_ch_id}:timeout:{elapsed:.0f}s")
-            logger.info(f"Challenge {current_ch_id} → cooldown, rotating to next")
+            logger.info(f"[Slot {slot_num}] Freed — challenge {ch_id} → cooldown")
+            continue
 
-        elif TASK_FILE.exists():
-            # ── IN PROGRESS: let agent continue ────────────────────
-            try:
-                task = json.loads(TASK_FILE.read_text())
-                logger.info(f"In progress ({elapsed:.0f}s/{TASK_TIMEOUT}s): "
-                            f"[{task.get('category')}] {task.get('title')}")
-            except Exception:
-                logger.info(f"In progress ({elapsed:.0f}s/{TASK_TIMEOUT}s): "
-                            f"challenge {current_ch_id}")
-            print(f"PENDING:{current_ch_id}:{elapsed:.0f}s")
-            return
+        # Task in progress — keep it
+        logger.info(f"[Slot {slot_num}] Running: challenge {ch_id} "
+                    f"({elapsed:.0f}s/{TASK_TIMEOUT}s)")
 
-    else:
-        # No current challenge — clean up any stale files
-        clear_abort()
-        if TASK_FILE.exists():
-            TASK_FILE.unlink()
-            logger.info("Cleaned up stale task file (no current challenge)")
+    # ── Step 2: Fill empty slots ───────────────────────────────────
 
-    # ── Step 2: Pick next challenge ─────────────────────────────────
+    free_slots = empty_slots(state)
+    if not free_slots:
+        # All slots busy
+        occ = occupied_slots(state)
+        status_parts = [f"{s}:ch{occ[s]['challenge_id']}" for s in sorted(occ)]
+        print(f"BUSY:{len(occ)}/{MAX_SLOTS}:{','.join(status_parts)}")
+        return
 
+    # Fetch all challenges
     all_challenges = client.get_all_challenge_details()
     now_ts = time.time()
+    in_flight = assigned_challenge_ids(state)
 
     eligible = []
-    skipped_cooldown = 0
     for ch in all_challenges:
         ch_id = str(ch.get("id"))
-        if ch_id in solved_ids:
-            continue
-        if ch_id in perm_failed:
-            continue
-        cooldown_until = state.get("cooldown_until", {}).get(ch_id, 0)
-        if cooldown_until > now_ts:
-            skipped_cooldown += 1
-            continue
+        if ch_id in solved_ids:     continue
+        if ch_id in perm_failed:    continue
+        if ch_id in in_flight:      continue  # already in another slot
+        cooldown = state.get("cooldown_until", {}).get(ch_id, 0)
+        if cooldown > now_ts:       continue
         eligible.append(ch)
 
-    if not eligible:
+    if not eligible and not occupied_slots(state):
+        # No slots occupied, nothing eligible — we're done
         status_msg = (f"ALL DONE! Solved: {len(solved_ids)}/{len(all_challenges)}"
                       f" | PermFailed: {len(perm_failed)}"
-                      f" | Cooldown: {skipped_cooldown}")
+                      f" | Cooldown: {sum(1 for _ in [])}")
         DONE_FILE.write_text(status_msg)
         DONE_FILE.chmod(0o644)
         logger.info(status_msg)
@@ -362,66 +396,83 @@ def main():
         ch.get("score", 0),
     ))
 
-    challenge = eligible[0]
-    ch_id = challenge["id"]
-    ch_key = str(ch_id)
+    # Fill each empty slot with the best eligible challenge
+    filled = 0
+    for slot_num in free_slots:
+        if not eligible:
+            break
+        challenge = eligible.pop(0)
+        ch_id = challenge["id"]
 
-    retries = state.get("retry_counts", {}).get(ch_key, 0)
-    if retries > 0:
-        logger.info(f"Retry #{retries + 1}/{MAX_RETRIES} for challenge {ch_id}: "
-                    f"{challenge.get('title')}")
-        # Show cooldown wait time
-        wait_time = max(0, int(now_ts - state.get("cooldown_until", {}).get(ch_key, now_ts)))
-        if wait_time > 0:
-            logger.info(f"  (waited {wait_time}s cooldown)")
+        retries = state.get("retry_counts", {}).get(str(ch_id), 0)
+        if retries > 0:
+            logger.info(f"[Slot {slot_num}] Retry #{retries + 1}/{MAX_RETRIES}: "
+                        f"{challenge.get('title')}")
 
-    # ── Step 3: Prepare ─────────────────────────────────────────────
+        # Quick flag check before dispatching
+        challenge, analysis, attachments = prepare_challenge(
+            client, challenge, attach_dir, state
+        )
 
-    attachments = client.download_challenge_attachments(challenge, attachment_dir)
-
-    if challenge.get("type") == "DynamicContainer":
-        logger.info(f"Creating container for challenge {ch_id}...")
-        client.create_container(ch_id)
-        if client.wait_for_container_ready(ch_id, timeout=60):
-            logger.info(f"Container ready: challenge {ch_id}")
-            challenge = client.get_challenge_detail(ch_id)
-        else:
-            logger.warning(f"Container not ready: challenge {ch_id}, proceeding anyway")
-
-    analysis = ChallengeAnalyzer.analyze_challenge(challenge)
-
-    # Quick flag checks
-    if analysis["flags_found"]:
-        for f in analysis["flags_found"]:
-            logger.info(f"Flag in description, auto-submit: {f}")
-            submit_and_record(client, ch_id, f, state)
-            _mark_solved(state, ch_id, f)
-            save_state(state)
-            return
-
-    for path in attachments:
-        from challenge_engine import basic_file_analysis
-        fa = basic_file_analysis(path)
-        if fa.get("flags_in_strings"):
-            for f in fa["flags_in_strings"]:
-                logger.info(f"Flag in attachment {path}: {f}")
+        if analysis.get("flags_found"):
+            for f in analysis["flags_found"]:
+                logger.info(f"Flag in description, auto-submit: {f}")
                 submit_and_record(client, ch_id, f, state)
                 _mark_solved(state, ch_id, f)
                 save_state(state)
-                return
+                continue  # skip this slot, will be filled next tick
 
-    # ── Step 4: Dispatch ────────────────────────────────────────────
+        # Check attachments for flags
+        found_in_attach = False
+        for path in attachments:
+            from challenge_engine import basic_file_analysis
+            fa = basic_file_analysis(path)
+            if fa.get("flags_in_strings"):
+                for f in fa["flags_in_strings"]:
+                    logger.info(f"Flag in attachment {path}: {f}")
+                    submit_and_record(client, ch_id, f, state)
+                    _mark_solved(state, ch_id, f)
+                    save_state(state)
+                    found_in_attach = True
+                    break
+        if found_in_attach:
+            continue  # skip this slot
 
-    state["current"] = ch_id
-    state["task_assigned_at"] = time.time()
-    # Record that we're starting a new attempt
-    record_attempt(state, ch_id, summary=f"Starting attempt")
+        # Assign to slot
+        record_attempt(state, ch_id, summary=f"Starting attempt (slot {slot_num})")
+        slots[str(slot_num)] = {
+            "challenge_id": ch_id,
+            "assigned_at": time.time(),
+        }
+        clear_abort(slot_num)
+        write_task(challenge, analysis, attachments, state=state, slot=slot_num)
+        filled += 1
+
     save_state(state)
 
-    write_task(challenge, analysis, attachments, state=state)
-
-    # Machine-readable output for agent loop
-    print(f"TASK:{ch_id}:{challenge.get('_category')}:{challenge.get('title')}")
+    # ── Output status ──────────────────────────────────────────────
+    occ = occupied_slots(state)
+    if filled > 0 or not occ:
+        # Fresh dispatch or re-check
+        if not occ and not empty_slots(state):
+            print("DONE")
+        elif occ:
+            parts = []
+            for s in sorted(occ):
+                d = occ[s]
+                ch_id = d["challenge_id"]
+                # Try to read title from task file
+                title = f"ch{ch_id}"
+                tf = task_file(s)
+                if tf.exists():
+                    try:
+                        t = json.loads(tf.read_text())
+                        title = t.get("title", title)[:20]
+                    except: pass
+                parts.append(f"s{s}:{title}")
+            print(f"DISPATCH:{len(occ)}/{MAX_SLOTS}:{','.join(parts)}")
+        else:
+            print("IDLE:waiting_for_cooldown")
 
 
 if __name__ == "__main__":

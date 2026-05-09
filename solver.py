@@ -56,7 +56,8 @@ def load_state() -> dict:
             state.setdefault("task_assigned_at", None)
             state.setdefault("attempted", {})
             state.setdefault("failed", [])
-            state.setdefault("attempt_history", {})      # v2.1
+            state["attempt_history"] = state.setdefault("attempt_history", {})
+            state["slots"] = state.setdefault("slots", {})            # v3
             return state
         except Exception:
             pass
@@ -69,8 +70,9 @@ def load_state() -> dict:
         "retry_counts": {},        # {challenge_id: count}
         "cooldown_until": {},      # {challenge_id: timestamp}
         "permanently_failed": {},  # {challenge_id: {reason, retries, at}}
-        "task_assigned_at": None,  # unix timestamp
-        "attempt_history": {},     # v2.1: {challenge_id: [{attempt, at, summary, tools_used, error}]}
+        "task_assigned_at": None,
+        "attempt_history": {},
+        "slots": {},                # v3: {"0": {"challenge_id":..., "assigned_at":...}, ...}
     }
 
 def save_state(state: dict):
