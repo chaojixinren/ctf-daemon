@@ -302,6 +302,7 @@ def main():
                 # Copy to slot task file
                 task_file(0).write_text(LEGACY_TASK.read_text())
                 LEGACY_TASK.unlink()
+                save_state(state)
                 logger.info(f"Migrated legacy task to slot 0: challenge {ch_id}")
         except Exception:
             if LEGACY_TASK.exists(): LEGACY_TASK.unlink()
