@@ -32,6 +32,11 @@ RESCUE_FLAGS_PATH = Path(
     os.environ.get("CTF_RESCUE_FLAGS", "/tmp/ctf_flags_rescue.txt")
 )
 
+# Overridable via CTF_WORKDIR_BASE env var
+WORKDIR_BASE = Path(
+    os.environ.get("CTF_WORKDIR_BASE", "/tmp")
+)
+
 
 def load_state() -> dict:
     """Load solver state from disk. Returns fresh default if file missing."""

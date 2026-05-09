@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-CTF Daemon v3.1 — Multi-slot concurrent orchestrator with LLM-driven selection.
-             精灵学会了分身术，同时处理多道题目，LLM 按难度自主排序。
+CTF Daemon v3.4 — Multi-slot concurrent orchestrator with LLM-driven selection.
+             精灵学会了分身术 + 搬家术，每道题拥有独立工作目录。
 
-Each "slot" is an independent challenge pipeline. The daemon fills empty 
-slots with eligible challenges, collects flags from all slots, and aborts 
-stuck ones individually — without blocking other slots.
+Per-challenge isolated workdirs:
+  /tmp/ctf_{sanitized_title}/
+    └── attachments, analysis files, exploit scripts — all scoped to one challenge
 
-Slot files:
+Slot files (unchanged):
   /tmp/ctf_tasks/
-    slot_0.json   → challenge for slot 0
+    slot_0.json   → challenge for slot 0 (includes "workdir" field)
     slot_1.json   → challenge for slot 1
     slot_2.json   → challenge for slot 2
     flag_0.txt    → flag found in slot 0
@@ -31,7 +31,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from gzctf_client import GZCTFClient, load_config
 from challenge_engine import ChallengeAnalyzer, extract_flag, build_solving_prompt, basic_file_analysis
 from solver import submit_and_record
-from state import load_state, save_state, TASKS_DIR
+from state import load_state, save_state, TASKS_DIR, WORKDIR_BASE
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                     format="%(asctime)s [daemon] %(message)s")
@@ -80,6 +80,24 @@ def _is_infra_failure(text: str) -> bool:
 
 def _compute_cooldown(retry_count: int) -> int:
     return min(MAX_COOLDOWN, BASE_COOLDOWN * (2 ** max(0, retry_count - 1)))
+
+# ── Workdir isolation ──────────────────────────────────────────────
+
+def sanitize_title(title: str) -> str:
+    """Convert challenge title to safe directory name: 'Ez_DSA' → 'ez_dsa'"""
+    import re
+    safe = title.lower().strip()
+    safe = re.sub(r'[^a-z0-9_-]', '_', safe)
+    safe = re.sub(r'_+', '_', safe)
+    safe = safe.strip('_')
+    return safe or "challenge"
+
+def challenge_workdir(title: str) -> Path:
+    """Get/create per-challenge isolated workdir: /tmp/ctf_{sanitized_title}/"""
+    base = Path(os.environ.get("CTF_WORKDIR_BASE", str(WORKDIR_BASE)))
+    wd = base / f"ctf_{sanitize_title(title)}"
+    wd.mkdir(parents=True, exist_ok=True)
+    return wd
 
 # ── Abort signaling ────────────────────────────────────────────────
 
@@ -136,7 +154,7 @@ def format_history_for_agent(history: list) -> str:
 # ── Task I/O ───────────────────────────────────────────────────────
 
 def write_task(challenge: dict, analysis: dict, attachments: list,
-               state: dict = None, slot: int = 0):
+               workdir: Path = None, state: dict = None, slot: int = 0):
     """Write task to a specific slot."""
     task = {
         "slot": slot,
@@ -152,6 +170,7 @@ def write_task(challenge: dict, analysis: dict, attachments: list,
         "has_container": analysis["has_container"],
         "container_entry": analysis.get("container_entry"),
         "attachments": attachments,
+        "workdir": str(workdir) if workdir else None,
         "context_file": str(analysis.get("attachment_url") or ""),
         "assigned_at": time.time(),
         "retry_number": state.get("retry_counts", {}).get(str(challenge.get("id")), 0) if state else 0,
@@ -269,10 +288,13 @@ def _free_slot(state: dict, slot: int):
 # ── Challenge preparation ──────────────────────────────────────────
 
 def prepare_challenge(client: GZCTFClient, challenge: dict,
-                      attachment_dir: str, state: dict = None) -> tuple:
-    """Prepare a challenge: attachments, container, analysis. Returns (challenge, analysis, attachments)."""
+                      workdir: Path, state: dict = None) -> tuple:
+    """Prepare a challenge: create workdir, download attachments, container, analysis.
+    Returns (challenge, analysis, attachments, workdir)."""
     ch_id = challenge["id"]
-    attachments = client.download_challenge_attachments(challenge, attachment_dir)
+    title = challenge.get("title", f"challenge_{ch_id}")
+    wd = workdir if workdir else challenge_workdir(title)
+    attachments = client.download_challenge_attachments(challenge, str(wd))
 
     if challenge.get("type") == "DynamicContainer":
         logger.info(f"Creating container for challenge {ch_id}...")
@@ -287,7 +309,7 @@ def prepare_challenge(client: GZCTFClient, challenge: dict,
             logger.warning(f"Container creation failed for {ch_id}: {e}")
 
     analysis = ChallengeAnalyzer.analyze_challenge(challenge)
-    return challenge, analysis, attachments
+    return challenge, analysis, attachments, wd
 
 # ── Main ───────────────────────────────────────────────────────────
 
@@ -297,7 +319,10 @@ def main():
     username    = config.get("GZCTF_USERNAME", "")
     password    = config.get("GZCTF_PASSWORD", "")
     game_id     = int(config.get("GZCTF_GAME_ID", "0"))
-    attach_dir  = config.get("ATTACHMENT_DIR", "/tmp/ctf_attachments")
+    # workdir_base supports CTF_WORKDIR_BASE from both config.env and env var
+    _wb = config.get("CTF_WORKDIR_BASE", "").strip()
+    if _wb:
+        os.environ.setdefault("CTF_WORKDIR_BASE", _wb)
 
     if not base_url or not username or not password:
         logger.error("Missing credentials in config.env")
@@ -515,8 +540,9 @@ def main():
             continue
 
         # Quick flag check before dispatching
-        challenge, analysis, attachments = prepare_challenge(
-            client, challenge, attach_dir, state
+        wd = challenge_workdir(challenge.get("title") or f"challenge_{ch_id}")
+        challenge, analysis, attachments, wd = prepare_challenge(
+            client, challenge, wd, state
         )
 
         if is_container:
@@ -552,7 +578,7 @@ def main():
             "assigned_at": time.time(),
         }
         clear_abort(slot_num)
-        write_task(challenge, analysis, attachments, state=state, slot=slot_num)
+        write_task(challenge, analysis, attachments, workdir=wd, state=state, slot=slot_num)
         filled += 1
 
     save_state(state)
