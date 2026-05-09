@@ -278,12 +278,29 @@ def _mark_solved(state: dict, ch_id: int, flag: str):
     for cleanup in ("retry_counts", "cooldown_until", "permanently_failed", "attempt_history"):
         state.get(cleanup, {}).pop(key, None)
 
-def _free_slot(state: dict, slot: int):
-    """Release a slot back to the pool."""
+def _free_slot(state: dict, slot: int, client=None):
+    """Release a slot back to the pool. If client provided, also delete container."""
+    # Read challenge_id before deleting task file (needed for container cleanup)
+    ch_id = None
+    tf = task_file(slot)
+    if tf.exists():
+        try:
+            task = json.loads(tf.read_text())
+            ch_id = task.get("challenge_id")
+        except (json.JSONDecodeError, OSError):
+            pass
+        tf.unlink()
+
     slots_state(state)[str(slot)] = None
     clear_abort(slot)
-    f = task_file(slot)
-    if f.exists(): f.unlink()
+
+    # Delete container via API to free platform resources
+    if client and ch_id is not None:
+        try:
+            client.delete_container(ch_id)
+            logger.info(f"[Slot {slot}] Container deleted: challenge {ch_id}")
+        except Exception as e:
+            logger.warning(f"[Slot {slot}] Failed to delete container {ch_id}: {e}")
 
 # ── Challenge preparation ──────────────────────────────────────────
 
@@ -309,8 +326,14 @@ def prepare_challenge(client: GZCTFClient, challenge: dict,
     if challenge.get("type") == "DynamicContainer":
         logger.info(f"Creating container for challenge {ch_id}...")
         try:
-            client.create_container(ch_id)
-            if client.wait_for_container_ready(ch_id, timeout=60):
+            result = client.create_container(ch_id)
+            # 400 = already exists — delete old and retry
+            if result is None and hasattr(client, 'session'):
+                logger.info(f"Container may already exist for {ch_id}, deleting old...")
+                client.delete_container(ch_id)
+                time.sleep(2)
+                result = client.create_container(ch_id)
+            if result and client.wait_for_container_ready(ch_id, timeout=60):
                 challenge = client.get_challenge_detail(ch_id)
                 logger.info(f"Container ready: challenge {ch_id}")
             else:
@@ -323,10 +346,13 @@ def prepare_challenge(client: GZCTFClient, challenge: dict,
 
 # ── Container health monitoring (v3.4) ─────────────────────────────
 
-def _check_container_health(state: dict):
+def _check_container_health(state: dict, client=None):
     """Check all occupied container slots for liveness. Dead containers → abort slot.
-    Retries 3 times with 1s delay between attempts to avoid transient failures."""
+    Retries 3 times with 1s delay. If client provided: delete dead containers via API,
+    extend alive ones if running >30min."""
     import socket
+
+    EXTEND_THRESHOLD = 1800  # extend container if running > 30 min
 
     for slot_num, slot_data in occupied_slots(state).items():
         ch_id = slot_data["challenge_id"]
@@ -343,7 +369,7 @@ def _check_container_health(state: dict):
         if not container_entry:
             continue  # no container to check
 
-        # Parse host:port — container_entry is "172.19.0.3:32771"
+        # Parse host:port
         try:
             host, port_str = container_entry.rsplit(":", 1)
             port = int(port_str)
@@ -366,7 +392,18 @@ def _check_container_health(state: dict):
                     time.sleep(1)
 
         if alive:
-            continue  # container is healthy
+            # Container healthy — extend if running for a while
+            elapsed = time.time() - slot_data.get("assigned_at", 0)
+            if client and elapsed > EXTEND_THRESHOLD:
+                try:
+                    client.extend_container(ch_id)
+                    logger.info(
+                        f"[Slot {slot_num}] Container extended: challenge {ch_id} "
+                        f"(running {elapsed:.0f}s)"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Slot {slot_num}] Extend failed for {ch_id}: {e}")
+            continue
 
         # Container dead after 3 retries
         elapsed = time.time() - slot_data.get("assigned_at", 0)
@@ -374,11 +411,18 @@ def _check_container_health(state: dict):
             f"[Slot {slot_num}] 💀 Container DEAD: challenge {ch_id} "
             f"({host}:{port}) after {elapsed:.0f}s"
         )
+        # Delete via API before freeing slot
+        if client:
+            try:
+                client.delete_container(ch_id)
+                logger.info(f"[Slot {slot_num}] Deleted dead container: challenge {ch_id}")
+            except Exception as e:
+                logger.warning(f"[Slot {slot_num}] Failed to delete dead container {ch_id}: {e}")
         record_attempt(state, ch_id,
                        summary=f"Container died at {host}:{port} after {elapsed:.0f}s")
         _mark_failed(state, ch_id, f"container_died ({host}:{port})", is_infra=True)
         signal_abort(slot_num, ch_id, f"Container unreachable: {host}:{port}")
-        _free_slot(state, slot_num)
+        _free_slot(state, slot_num)  # client not passed — already deleted above
         save_state(state)
         logger.info(f"[Slot {slot_num}] Freed — container dead → cooldown (no retry penalty)")
 
@@ -464,14 +508,14 @@ def main():
             _sync_solved_from_platform(state, client)
             if str(ch_id) in state.get("solved", {}):
                 logger.info(f"[Slot {slot_num}] ✅ Verified solved: challenge {ch_id}")
-                _free_slot(state, slot_num)
+                _free_slot(state, slot_num, client)
                 save_state(state)
                 continue
             else:
                 # Flag rejected — retry later
                 logger.warning(f"[Slot {slot_num}] ❌ Flag REJECTED: challenge {ch_id}")
                 _mark_failed(state, ch_id, "flag_rejected", is_infra=False)
-                _free_slot(state, slot_num)
+                _free_slot(state, slot_num, client)
                 save_state(state)
                 continue
 
@@ -491,7 +535,7 @@ def main():
                           error=f"Exceeded TASK_TIMEOUT ({TASK_TIMEOUT}s)")
             _mark_failed(state, ch_id, f"timeout ({elapsed:.0f}s)", is_infra)
             signal_abort(slot_num, ch_id, f"timeout ({elapsed:.0f}s)")
-            _free_slot(state, slot_num)
+            _free_slot(state, slot_num, client)
             save_state(state)
             logger.info(f"[Slot {slot_num}] Freed — challenge {ch_id} → cooldown")
             continue
@@ -501,7 +545,7 @@ def main():
                     f"({elapsed:.0f}s/{TASK_TIMEOUT}s)")
 
     # ── Step 1.5: Container health check ───────────────────────────
-    _check_container_health(state)
+    _check_container_health(state, client)
 
     # ── Step 2: Fill empty slots ───────────────────────────────────
 
