@@ -289,10 +289,20 @@ def _free_slot(state: dict, slot: int):
 
 def prepare_challenge(client: GZCTFClient, challenge: dict,
                       workdir: Path, state: dict = None) -> tuple:
-    """Prepare a challenge: create workdir, download attachments, container, analysis.
+    """Prepare a challenge: fetch full detail, download attachments, container, analysis.
     Returns (challenge, analysis, attachments, workdir)."""
     ch_id = challenge["id"]
     title = challenge.get("title", f"challenge_{ch_id}")
+
+    # Fetch full detail if attachments haven't been loaded yet
+    # get_all_challenge_details() returns summary without context/attachments
+    if not challenge.get("context") and not challenge.get("attachmentUrl"):
+        try:
+            challenge = client.get_challenge_detail(ch_id)
+            logger.info(f"Fetched full detail for challenge {ch_id}")
+        except Exception as e:
+            logger.warning(f"Failed to fetch detail for {ch_id}: {e}")
+
     wd = workdir if workdir else challenge_workdir(title)
     attachments = client.download_challenge_attachments(challenge, str(wd))
 
@@ -520,8 +530,13 @@ def main():
     # Fill each empty slot with the best eligible challenge
     filled = 0
     containers_this_run = 0
+    postponed = []  # challenges skipped due to container limit — retry after fill
     MAX_CONTAINERS_PER_RUN = 2  # Don't spin up more than 2 containers per daemon tick
     for slot_num in free_slots:
+        # Try eligible first, then postponed container challenges
+        if not eligible:
+            eligible = postponed
+            postponed = []
         if not eligible:
             break
         challenge = eligible.pop(0)
@@ -532,11 +547,12 @@ def main():
             logger.info(f"[Slot {slot_num}] Retry #{retries + 1}/{MAX_RETRIES}: "
                         f"{challenge.get('title')}")
 
-        # Container rate-limit: skip container challenges if we've hit the cap
+        # Container rate-limit: defer container challenges to postponed list
         is_container = "Container" in (challenge.get("type") or "")
         if is_container and containers_this_run >= MAX_CONTAINERS_PER_RUN:
-            logger.info(f"[Slot {slot_num}] Skipping {challenge.get('title')} — "
+            logger.info(f"[Slot {slot_num}] Deferring {challenge.get('title')} — "
                         f"container limit ({MAX_CONTAINERS_PER_RUN}) reached")
+            postponed.append(challenge)
             continue
 
         # Quick flag check before dispatching
@@ -553,8 +569,8 @@ def main():
                 logger.info(f"Flag in description, auto-submit: {f}")
                 submit_and_record(client, ch_id, f, state)
                 _mark_solved(state, ch_id, f)
-                save_state(state)
-                continue  # skip this slot, will be filled next tick
+            save_state(state)
+            continue  # flag found — skip this slot, will be filled next tick
 
         # Check attachments for flags
         found_in_attach = False
@@ -565,11 +581,11 @@ def main():
                     logger.info(f"Flag in attachment {path}: {f}")
                     submit_and_record(client, ch_id, f, state)
                     _mark_solved(state, ch_id, f)
-                    save_state(state)
-                    found_in_attach = True
-                    break
+                save_state(state)
+                found_in_attach = True
+                break
         if found_in_attach:
-            continue  # skip this slot
+            continue  # flag found in attachment — skip this slot
 
         # Assign to slot
         record_attempt(state, ch_id, summary=f"Starting attempt (slot {slot_num})")

@@ -194,7 +194,7 @@ class ChallengeAnalyzer:
     def analyze_challenge(cls, detail: Dict) -> Dict:
         """Analyze a challenge and return recommended actions."""
         category = detail.get("_category", detail.get("category", "Misc"))
-        ch_type = detail.get("type", "StaticAttachment")
+        ch_type = detail.get("type", "Unknown")  # v3.4: don't default to StaticAttachment
         title = detail.get("title", "Unknown")
         content = detail.get("content", "")
         hints = cls._normalize_hints(detail.get("hints", []))
