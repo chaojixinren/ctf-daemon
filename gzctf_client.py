@@ -1,5 +1,6 @@
 """
-GZCTF API Client - Autonomous CTF Solver
+GZCTF API Client — Autonomous CTF Solver.
+API patterns inspired by Misuzu's GZCTF plugin (github.com/TechnickOcean/Misuzu).
 Handles authentication, challenge fetching, flag submission.
 """
 

@@ -201,7 +201,9 @@ LOOP:
 
 ## 灵感来源 · Inspiration
 
-借鉴了 [LingXi（灵犀）](https://github.com/chaojixinren/LingXi) 的并发任务模型——它教会了精灵"一道题卡住了，先去解别的"。
+- 并发任务模型借鉴了 [**LingXi（灵犀）**](https://github.com/chaojixinren/LingXi) —— "一道题卡住了，先去解别的"
+- GZCTF API 交互模式借鉴了 [**Misuzu**](https://github.com/TechnickOcean/Misuzu) 的 GZCTF 插件 —— 多 Agent 并发 CTF 系统
+- 工具链由 [**Kali-Security-MCP**](https://github.com/SeaC-25/Kali-Security-MCP) 提供 —— 200+ Kali 工具通过 MCP 协议暴露给 AI
 
 ## 精灵的档案 · Files
 
