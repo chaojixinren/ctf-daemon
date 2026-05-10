@@ -1,5 +1,7 @@
 # CTF Daemon · Hermes-native autonomous competition framework
 
+[中文版](README_CN.md)
+
 > *You sleep. The daemon works.*
 
 A Hermes Agent-native framework for fully autonomous CTF competition solving.

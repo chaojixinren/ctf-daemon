@@ -1,5 +1,7 @@
 # CTF Daemon · Hermes 原生全自动竞赛框架
 
+[English](README.md)
+
 > *你睡觉。守护进程在干活。*
 
 一个 Hermes Agent 原生的全自动 CTF 解题框架。支持多槽位并发调度、单题独立工作目录、
