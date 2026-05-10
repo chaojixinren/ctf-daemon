@@ -17,6 +17,35 @@ import requests
 
 logger = logging.getLogger("gzctf")
 
+# ── API Retry ────────────────────────────────────────────────────
+_MAX_API_RETRIES = 3
+_API_RETRY_DELAY = 2.0
+_RETRYABLE_STATUSES = {502, 503, 504}
+
+def _api_retry(func, *args, _desc: str = "API call", **kwargs):
+    """v3.5: Retry transient API failures with exponential backoff."""
+    last_error = None
+    for attempt in range(_MAX_API_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except requests.exceptions.Timeout as e:
+            last_error = e
+            if attempt + 1 < _MAX_API_RETRIES:
+                delay = _API_RETRY_DELAY * (2 ** attempt)
+                logger.warning(f"{_desc} timeout (attempt {attempt+1}/{_MAX_API_RETRIES}), "
+                             f"retrying in {delay:.0f}s...")
+                time.sleep(delay)
+        except requests.exceptions.ConnectionError as e:
+            last_error = e
+            if attempt + 1 < _MAX_API_RETRIES:
+                delay = _API_RETRY_DELAY * (2 ** attempt)
+                logger.warning(f"{_desc} connection error (attempt {attempt+1}/{_MAX_API_RETRIES}), "
+                             f"retrying in {delay:.0f}s...")
+                time.sleep(delay)
+        except Exception as e:
+            raise  # non-retryable
+    raise last_error
+
 class GZCTFClient:
     """Client for GZCTF competition platform API."""
 
@@ -170,19 +199,23 @@ class GZCTFClient:
         return {"id": challenge_id, "_error": "not found"}
 
     def get_all_challenge_details(self) -> List[Dict]:
-        """Get details for ALL challenges in the game."""
+        """Get details for ALL challenges in the game.
+
+        v3.5: Fetches from /details endpoint (single request) first,
+        then falls back to individual detail fetches only for challenges
+        that need full context (attachments, container). This avoids
+        N+1 requests (40 challenges = 1 request instead of 80+).
+        """
         challenges = self.get_challenges()
         all_details = []
         for category, ch_list in challenges.items():
             for ch in ch_list:
-                try:
-                    detail = self.get_challenge_detail(ch["id"])
-                    detail["_category"] = category
-                    all_details.append(detail)
-                except Exception as e:
-                    logger.error(f"Failed to get detail for challenge {ch['id']}: {e}")
-                    ch["_category"] = category
-                    all_details.append(ch)
+                ch["_category"] = category
+                # v3.5: /details already has type, status, score, content.
+                # Only fetch individual detail if we need attachments/container.
+                # During dispatch, prepare_challenge() will fetch full detail
+                # when needed — not here.
+                all_details.append(ch)
         return all_details
 
     # ── Flag Submission ───────────────────────────────────────────
@@ -330,7 +363,14 @@ class GZCTFClient:
     # ── Containers (Dynamic Challenges) ───────────────────────────
 
     def create_container(self, challenge_id: int) -> Optional[Dict]:
-        """Create a container for a dynamic challenge."""
+        """Create a container for a dynamic challenge.
+
+        v3.5: Returns structured result with error codes so callers can react:
+          - 200/201: container created → dict with 'entry' key
+          - 400: already exists (caller should delete+recreate)
+          - 429: rate limited (caller should back off)
+          - None: network error / timeout
+        """
         resp = self.session.post(
             urljoin(self.base_url, f"/api/game/{self.game_id}/container/{challenge_id}"),
             timeout=30,
@@ -340,25 +380,49 @@ class GZCTFClient:
             entry = data.get("entry", "")
             logger.info(f"Container created for challenge {challenge_id}: {entry or 'no entry'}")
             return data
-        logger.warning(f"Container create failed: {resp.status_code}")
-        return None
+        # Structured error info
+        error_info = {
+            "_error": True,
+            "_status": resp.status_code,
+            "_challenge_id": challenge_id,
+        }
+        if resp.status_code == 400:
+            logger.warning(f"Container create 400 for {challenge_id} — already exists")
+        elif resp.status_code == 429:
+            logger.warning(f"Container create 429 for {challenge_id} — rate limited")
+        else:
+            logger.warning(f"Container create failed {resp.status_code} for {challenge_id}")
+        return error_info
+
+    def _resolve_container_host(self, entry: str) -> tuple:
+        """Parse container entry into (host, port). Handles bare port numbers.
+
+        GZCTF instanceEntry formats: "host:port", "bare_port", "host"
+        """
+        try:
+            host, port_str = entry.rsplit(":", 1)
+            return host, int(port_str)
+        except ValueError:
+            # Bare port or host-only
+            try:
+                port = int(entry)
+                from urllib.parse import urlparse
+                host = urlparse(self.base_url).hostname or "localhost"
+                return host, port
+            except (ValueError, TypeError):
+                return "localhost", 80
 
     def wait_for_container_ready(self, challenge_id: int, timeout: int = 60) -> bool:
         """Poll until container is ready and entry point is available.
-        Returns True if ready, False on timeout.
-        """
+        v3.5: handles bare port instanceEntry via _resolve_container_host."""
         import socket
         deadline = time.time() + timeout
         while time.time() < deadline:
-            # Re-fetch challenge detail to check container state
             detail = self.get_challenge_detail(challenge_id)
             context = detail.get("context", {}) or {}
             entry = context.get("instanceEntry")
             if entry:
-                # Probe the port
-                parts = entry.rsplit(":", 1)
-                host = parts[0]
-                port = int(parts[1]) if len(parts) > 1 else 80
+                host, port = self._resolve_container_host(entry)
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     sock.settimeout(3)
@@ -400,7 +464,7 @@ class GZCTFClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_submissions(self) -> List[Dict]:
+    def get_team_submissions(self) -> List[Dict]:
         """Get own team's submissions."""
         resp = self.session.get(
             urljoin(self.base_url, f"/api/game/{self.game_id}/submissions"),
@@ -408,6 +472,26 @@ class GZCTFClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    def get_team_accepted_challenges(self) -> set[str]:
+        """Get challenge IDs where this team has an accepted submission.
+
+        v3.5: Uses the submissions endpoint (per-team) instead of /details
+        (global) to avoid false positives from other teams' solves.
+        """
+        accepted = set()
+        try:
+            subs = self.get_team_submissions()
+            if isinstance(subs, dict) and "data" in subs:
+                subs = subs["data"]
+            if isinstance(subs, list):
+                for sub in subs:
+                    status = str(sub.get("status", "")).lower()
+                    if status in ("accepted", "correct", "solved", "success"):
+                        accepted.add(str(sub.get("challenge", sub.get("challengeId", ""))))
+        except Exception as e:
+            logger.warning(f"Failed to fetch team submissions: {e}")
+        return accepted
 
     # ── Health Check ──────────────────────────────────────────────
 

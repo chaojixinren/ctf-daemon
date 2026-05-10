@@ -28,7 +28,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from gzctf_client import GZCTFClient, load_config
+from gzctf_client import GZCTFClient, load_config, _api_retry
 from challenge_engine import ChallengeAnalyzer, extract_flag, build_solving_prompt, basic_file_analysis
 from solver import submit_and_record
 from state import load_state, save_state, TASKS_DIR, WORKDIR_BASE
@@ -185,14 +185,55 @@ def write_task(challenge: dict, analysis: dict, attachments: list,
     logger.info(f"[Slot {slot}] Task: [{challenge.get('_category')}] "
                 f"{challenge.get('title')} (ID:{challenge.get('id')})")
 
-def read_flag(slot: int) -> str | None:
+def read_flag(slot: int, expected_ch_id: int = None) -> str | None:
+    """Read flag from slot. v3.5: verifies challenge_id if present in flag file.
+
+    New format (JSON): {"challenge_id": 42, "flag": "dutctf{...}"}
+    Legacy format (plain): "dutctf{...}" — accepted with warning, no ch_id guard.
+
+    If expected_ch_id is provided and the flag file contains a different
+    challenge_id, returns None — prevents cross-challenge mis-submission.
+    """
     f = flag_file(slot)
-    if f.exists():
-        flag = f.read_text().strip()
-        if flag:
+    if not f.exists():
+        return None
+    raw = f.read_text().strip()
+    if not raw:
+        return None
+
+    # Try new JSON format first
+    flag_text = None
+    file_ch_id = None
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "flag" in data:
+            flag_text = data["flag"]
+            file_ch_id = data.get("challenge_id")
+            if file_ch_id is not None:
+                file_ch_id = int(file_ch_id)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        # Legacy plain-text flag
+        flag_text = raw
+        logger.warning(
+            f"[Slot {slot}] Legacy flag format — upgrade to JSON with challenge_id "
+            f"for cross-challenge safety"
+        )
+
+    if not flag_text:
+        return None
+
+    # Cross-challenge guard
+    if expected_ch_id is not None and file_ch_id is not None:
+        if file_ch_id != expected_ch_id:
+            logger.error(
+                f"[Slot {slot}] FLAG MISMATCH: flag file ch_id={file_ch_id} "
+                f"but slot ch_id={expected_ch_id} — refusing to submit"
+            )
             f.unlink()
-            return flag
-    return None
+            return None
+
+    f.unlink()
+    return flag_text
 
 # ── State / slot management ────────────────────────────────────────
 
@@ -275,6 +316,64 @@ def _sync_solved_from_platform(state: dict, client: GZCTFClient):
         logger.info(f"Synced {newly_discovered} challenges from platform")
     return newly_discovered
 
+def _is_likely_real_flag(flag: str) -> bool:
+    """Reject regex format hints / placeholder text masquerading as flags.
+
+    Real flags look like ``DUTCTF{<concrete-content>}``; format hints like
+    ``DUTCTF{.+}`` or placeholders like ``CTF{...}`` extracted from challenge
+    descriptions or attachments must not be auto-submitted (they poison
+    state and waste submission attempts).
+
+    v3.5: Additional checks for emoji, very-long flags (>200 chars),
+    known false-positive patterns from challenge descriptions.
+    """
+    if not flag or not isinstance(flag, str):
+        return False
+    s = flag.strip()
+    # Must contain {...}
+    lb = s.find("{")
+    rb = s.rfind("}")
+    if lb < 0 or rb < 0 or rb <= lb:
+        return False
+    inner = s[lb + 1:rb]
+    # Empty body, e.g. flag{}, CTF{}, DUTCTF{}
+    if not inner.strip():
+        return False
+    # Literal "..." placeholder
+    if inner.strip() == "...":
+        return False
+    # v3.5: Emoji in flag body — almost certainly false positive
+    import unicodedata
+    if any(unicodedata.category(c) == 'So' for c in inner):
+        return False
+    # v3.5: Very long flags (>200 chars) — likely junk, not a real CTF flag
+    if len(inner) > 200:
+        return False
+    # Regex metachars that signal a format hint, not a real flag
+    regex_markers = (".+", ".*", "\\w", "\\d", "\\s", "[a-z]", "[A-Z]",
+                     "[0-9]", "[^", "(?", "|")
+    for m in regex_markers:
+        if m in inner:
+            return False
+    # v3.5: Brackets inside flag body — format hint, not real flag
+    if "(" in inner and ")" in inner:
+        return False
+    # v3.5: Common description patterns that match flag regex
+    fake_patterns = (
+        "flag format", "flag形式", "flag格式", "flag的格式",
+        "格式为", "format is", "example:", "e.g.", "例如",
+        "提交格式", "submission format",
+    )
+    lower_flag = s.lower()
+    if any(p in lower_flag for p in fake_patterns):
+        return False
+    # Body must have at least 3 alphanumeric chars (real flags are longer)
+    alnum = sum(1 for c in inner if c.isalnum())
+    if alnum < 3:
+        return False
+    return True
+
+
 def _mark_solved(state: dict, ch_id: int, flag: str):
     key = str(ch_id)
     state["solved"][key] = flag
@@ -293,6 +392,15 @@ def _free_slot(state: dict, slot: int, client=None):
         except (json.JSONDecodeError, OSError):
             pass
         tf.unlink()
+
+    # Bug 2 fix: delete any stale flag pickup file so a subsequent reassignment
+    # of this slot doesn't read a leftover flag from the previous challenge.
+    ff = flag_file(slot)
+    if ff.exists():
+        try:
+            ff.unlink()
+        except OSError:
+            pass
 
     slots_state(state)[str(slot)] = None
     clear_abort(slot)
@@ -330,17 +438,29 @@ def prepare_challenge(client: GZCTFClient, challenge: dict,
         logger.info(f"Creating container for challenge {ch_id}...")
         try:
             result = client.create_container(ch_id)
-            # 400 = already exists — delete old and retry
-            if result is None and hasattr(client, 'session'):
-                logger.info(f"Container may already exist for {ch_id}, deleting old...")
-                client.delete_container(ch_id)
-                time.sleep(2)
-                result = client.create_container(ch_id)
-            if result and client.wait_for_container_ready(ch_id, timeout=60):
-                challenge = client.get_challenge_detail(ch_id)
-                logger.info(f"Container ready: challenge {ch_id}")
+            # v3.5: structured error handling
+            if result is None:
+                # Network error — can't tell, just log
+                logger.warning(f"Container create failed (network) for {ch_id}")
+            elif isinstance(result, dict) and result.get("_error"):
+                status = result.get("_status", 0)
+                if status == 400:
+                    logger.info(f"Container exists for {ch_id}, deleting old...")
+                    client.delete_container(ch_id)
+                    time.sleep(2)
+                    result = client.create_container(ch_id)
+                elif status == 429:
+                    logger.warning(f"Container rate-limited for {ch_id}, skipping container")
+                    result = None
+            # Proceed if we got a valid non-error result
+            if result and not (isinstance(result, dict) and result.get("_error")):
+                if client.wait_for_container_ready(ch_id, timeout=60):
+                    challenge = client.get_challenge_detail(ch_id)
+                    logger.info(f"Container ready: challenge {ch_id}")
+                else:
+                    logger.warning(f"Container not ready: challenge {ch_id}")
             else:
-                logger.warning(f"Container not ready: challenge {ch_id}")
+                logger.warning(f"Container not available: challenge {ch_id}")
         except Exception as e:
             logger.warning(f"Container creation failed for {ch_id}: {e}")
 
@@ -349,11 +469,59 @@ def prepare_challenge(client: GZCTFClient, challenge: dict,
 
 # ── Container health monitoring (v3.4) ─────────────────────────────
 
+def _resolve_container_hostport(container_entry: str, client=None) -> tuple:
+    """Parse container_entry into (host, port). v3.5: handles bare port numbers.
+
+    GZCTF instanceEntry formats observed:
+      - "host.example.com:32276" → (host, 32276)
+      - "10.0.0.5:8080"         → ("10.0.0.5", 8080)
+      - "32276" (bare port)     → (platform_host, 32276)  — use client.base_url
+    """
+    try:
+        host, port_str = container_entry.rsplit(":", 1)
+        return host, int(port_str)
+    except ValueError:
+        # Single token — bare port?
+        try:
+            port = int(container_entry)
+            if client and client.base_url:
+                from urllib.parse import urlparse
+                host = urlparse(client.base_url).hostname or "localhost"
+            else:
+                host = "localhost"
+            return host, port
+        except (ValueError, TypeError):
+            return None, None
+
+def _probe_container_liveness(sock, host: str, port: int, timeout: float = 1.5) -> bool:
+    """After TCP connect, verify the service actually responds with data.
+
+    Strategy:
+      - Send HTTP GET / (most services respond)
+      - If response received (even HTTP error), service is alive
+      - If connection reset / no data in timeout, service is dead (socat mismatch)
+
+    Returns True if service appears alive, False if no data exchange.
+    """
+    try:
+        sock.settimeout(timeout)
+        sock.sendall(b"GET / HTTP/1.0\r\nHost: %b\r\n\r\n" % host.encode())
+        # Try to read at least 1 byte
+        data = sock.recv(1)
+        return len(data) > 0
+    except (socket.error, OSError):
+        return False
+
 def _check_container_health(state: dict, client=None):
     """Check all occupied container slots for liveness. Dead containers → abort slot.
     Retries 3 times with 1s delay. If client provided: delete dead containers via API,
-    extend alive ones if running >30min."""
+    extend alive ones if running >30min.
+
+    v3.5: After TCP connect success, performs a liveness probe (HTTP GET for web ports,
+    raw read for generic ports) to detect the socat port-mismatch case where TCP
+    accepts but no data flows (shell → /dev/null)."""
     import socket
+    import struct
 
     EXTEND_THRESHOLD = 1800  # extend container if running > 30 min
 
@@ -372,11 +540,9 @@ def _check_container_health(state: dict, client=None):
         if not container_entry:
             continue  # no container to check
 
-        # Parse host:port
-        try:
-            host, port_str = container_entry.rsplit(":", 1)
-            port = int(port_str)
-        except (ValueError, TypeError):
+        # Parse host:port (v3.5: handle bare port by using platform host)
+        host, port = _resolve_container_hostport(container_entry, client)
+        if host is None or port is None:
             logger.warning(f"[Slot {slot_num}] Bad container_entry: {container_entry}")
             continue
 
@@ -387,9 +553,12 @@ def _check_container_health(state: dict, client=None):
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(2)
                 sock.connect((host, port))
+                # v3.5: after TCP connect, do a liveness probe
+                if _probe_container_liveness(sock, host, port):
+                    alive = True
                 sock.close()
-                alive = True
-                break
+                if alive:
+                    break
             except (socket.error, OSError):
                 if attempt < 3:
                     time.sleep(1)
@@ -451,6 +620,13 @@ def main():
         logger.error("Login failed")
         sys.exit(1)
 
+    # v3.5: Session health gate — if session expired since last run, re-login.
+    # This prevents the daemon "fake running" with expired cookies where
+    # all API calls silently return HTML instead of JSON.
+    if not client.is_logged_in() and not client.login():
+        logger.error("Session expired and re-login failed")
+        sys.exit(1)
+
     if game_id == 0:
         games = client.list_games()
         if not games:
@@ -465,10 +641,23 @@ def main():
     slots = slots_state(state)  # ensure initialized
     
     # ── Sync with platform truth ──────────────────────────────────
-    _sync_solved_from_platform(state, client)
+    # v3.5: Use get_team_accepted_challenges() (per-team) instead of
+    # /details (global) to avoid false positives from other teams.
+    # Also works as a checkpoint: if the team submitted flags via the
+    # web UI or another tool, the daemon auto-discovers them here.
+    platform_solved = client.get_team_accepted_challenges()
+    newly_synced = 0
+    internal = state["solved"]
+    for ch_id in platform_solved:
+        if ch_id not in internal:
+            internal[ch_id] = "synced_from_platform"
+            newly_synced += 1
+            logger.info(f"Platform sync: challenge {ch_id} already solved by team")
+    if newly_synced:
+        state["solved"] = internal
+        save_state(state)
     solved_ids = set(state["solved"].keys())
     # v3.1: Never permanently fail a challenge — always allow retries.
-    # perm_failed is kept for backward compat only, not used for filtering.
 
     # ── Legacy migration: if old task files exist, move to slot 0 ──
     if LEGACY_TASK.exists() and slots.get("0") is None:
@@ -503,12 +692,12 @@ def main():
         assigned_at = slot_data.get("assigned_at", 0)
         elapsed = time.time() - assigned_at if assigned_at else 0
 
-        flag = read_flag(slot_num)
+        flag = read_flag(slot_num, expected_ch_id=ch_id)
         if flag:
             logger.info(f"[Slot {slot_num}] Flag: challenge {ch_id}: {flag}")
             submit_and_record(client, ch_id, flag, state)
-            # Verify on platform before trusting
-            _sync_solved_from_platform(state, client)
+            # submit_and_record updates state["solved"] iff platform returned
+            # Accepted/AlreadySolved (see solver.py). Trust that, skip sync.
             if str(ch_id) in state.get("solved", {}):
                 logger.info(f"[Slot {slot_num}] ✅ Verified solved: challenge {ch_id}")
                 _free_slot(state, slot_num, client)
@@ -560,8 +749,20 @@ def main():
         print(f"BUSY:{len(occ)}/{MAX_SLOTS}:{','.join(status_parts)}")
         return
 
-    # Fetch all challenges
-    all_challenges = client.get_all_challenge_details()
+    # Fetch all challenges (with retry for transient failures)
+    try:
+        all_challenges = _api_retry(
+            client.get_all_challenge_details,
+            _desc="Fetch challenges"
+        )
+    except Exception as e:
+        logger.error(f"Failed to fetch challenges after retries: {e}")
+        # Try one more time without retry (maybe a different error pattern)
+        try:
+            all_challenges = client.get_all_challenge_details()
+        except Exception:
+            logger.error("Cannot fetch challenges — skipping this tick")
+            return
     now_ts = time.time()
     in_flight = assigned_challenge_ids(state)
 
@@ -611,19 +812,29 @@ def main():
         }, ensure_ascii=False))
 
     MENU_FILE = Path("/tmp/ctf_menu.jsonl")
-    MENU_FILE.write_text("\n".join(menu_lines))
+    # v3.5: Atomic write — write to temp file first, then rename.
+    # Prevents race condition where a reader sees a half-written file.
+    MENU_TMP = Path("/tmp/ctf_menu.jsonl.tmp")
+    MENU_TMP.write_text("\n".join(menu_lines))
+    MENU_TMP.rename(MENU_FILE)
 
     # Check if LLM already made a selection
     SEL_FILE = Path("/tmp/ctf_selection.json")
     if SEL_FILE.exists():
         try:
+            # v3.5: Read selection then consume atomically before processing.
+            # If another daemon process deletes it after our read, the
+            # unlink is a no-op — safe for multiple consumers.
             sel = json.loads(SEL_FILE.read_text())
             ordered_ids = sel.get("challenge_ids", [])
+            SEL_FILE.unlink()  # consume the selection
             # Reorder eligible to match LLM's priority
             id_to_ch = {str(ch.get("id")): ch for ch in eligible}
             eligible = [id_to_ch[cid] for cid in ordered_ids if cid in id_to_ch]
             logger.info(f"Using LLM selection: {ordered_ids}")
-            SEL_FILE.unlink()  # consume the selection
+        except FileNotFoundError:
+            # Race: another process consumed it between exists() and read
+            pass
         except Exception as e:
             logger.warning(f"Failed to parse LLM selection: {e}")
     else:
@@ -676,22 +887,39 @@ def main():
             containers_this_run += 1
 
         if analysis.get("flags_found"):
+            real_flags = []
             for f in analysis["flags_found"]:
-                logger.info(f"Flag in description, auto-submit: {f}")
-                submit_and_record(client, ch_id, f, state)
-                _mark_solved(state, ch_id, f)
-            save_state(state)
-            continue  # flag found — skip this slot, will be filled next tick
+                if not _is_likely_real_flag(f):
+                    logger.info(f"Skipping placeholder/regex-hint in description: {f!r}")
+                    continue
+                real_flags.append(f)
+            if real_flags:
+                for f in real_flags:
+                    logger.info(f"Flag in description, auto-submit: {f}")
+                    # submit_and_record updates state["solved"] only on
+                    # Accepted/AlreadySolved — do not _mark_solved here.
+                    submit_and_record(client, ch_id, f, state)
+                save_state(state)
+                continue  # attempted submission — skip this slot, refilled next tick
 
         # Check attachments for flags
         found_in_attach = False
         for path in attachments:
             fa = basic_file_analysis(path)
             if fa.get("flags_in_strings"):
+                real_flags = []
                 for f in fa["flags_in_strings"]:
+                    if not _is_likely_real_flag(f):
+                        logger.info(f"Skipping placeholder/regex-hint in attachment {path}: {f!r}")
+                        continue
+                    real_flags.append(f)
+                if not real_flags:
+                    continue  # try next attachment
+                for f in real_flags:
                     logger.info(f"Flag in attachment {path}: {f}")
+                    # Rely on submit_and_record to update state["solved"]
+                    # only on Accepted/AlreadySolved.
                     submit_and_record(client, ch_id, f, state)
-                    _mark_solved(state, ch_id, f)
                 save_state(state)
                 found_in_attach = True
                 break
@@ -700,6 +928,16 @@ def main():
 
         # Assign to slot
         record_attempt(state, ch_id, summary=f"Starting attempt (slot {slot_num})")
+        # Bug 2 fix: drop any stale flag pickup file before assigning new task,
+        # so a leftover flag_<slot>.txt from a prior challenge is not read by
+        # read_flag() and submitted against the wrong challenge.
+        _stale_ff = flag_file(slot_num)
+        if _stale_ff.exists():
+            try:
+                _stale_ff.unlink()
+                logger.info(f"[Slot {slot_num}] Removed stale flag file before reassign")
+            except OSError:
+                pass
         slots[str(slot_num)] = {
             "challenge_id": ch_id,
             "assigned_at": time.time(),
