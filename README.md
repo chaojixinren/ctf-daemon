@@ -1,295 +1,213 @@
-# CTF 精灵 · Daemon v3.4.4
+# CTF Daemon · Hermes-native autonomous competition framework
 
-> *"Daemon" — a Unix background process, and a spirit that works while you sleep.*  
-> *你只管睡觉，精灵替你解题。精灵学会了分身术+搬家术，每道题有独立的家。*
+> *You sleep. The daemon works.*
 
-Worker-pattern autonomous CTF solver. The **精灵 (spirit)** wakes every 60 seconds,
-fills up to 3 concurrent challenge slots, collects flags from all, submits them — 
-all without supervision. **v3.4 adds per-challenge isolated workdirs** — no more
-file confusion when 19 challenges dump attachments into one folder.
-**v3.4.4 fixes pure-Chinese title collision** — challenges with titles that sanitize to the same string (e.g. all-Chinese names) now get unique workdirs via `_{id}` suffix.
+A Hermes Agent-native framework for fully autonomous CTF competition solving.
+Multi-slot concurrent dispatch, isolated per-challenge workdirs, full container
+lifecycle management, LLM-driven challenge selection, platform-verified
+submission pipeline. Designed to run unattended for the full duration of a
+competition — from opening bell to scoreboard freeze.
 
-```
-                      ┌──────────────────────────────────────┐
-                      │       CTF Daemon v3.4                 │
-                      │      (精灵 · 分身 + 搬家)               │
-                      │                                       │
-  GZCTF Platform ────▶│  Slot 0: Misc challenge    ───▶ ...  │
-                      │    └─ workdir: /tmp/ctf_cyberchef/    │
-                      │  Slot 1: Crypto challenge  ───▶ ...  │
-                      │    └─ workdir: /tmp/ctf_ez_dsa/       │
-                      │  Slot 2: Pwn challenge     ───▶ ...  │
-                      │    └─ workdir: /tmp/ctf_babyrop/      │
-                      │                                       │
-                      │  each slot: isolated workdir          │
-                      │  each slot: timeout / abort            │
-                      │  each slot: independent retry          │
-                      │  one stuck ≠ all stuck                 │
-                      └──────────────────────────────────────┘
-                               ▲         ▲         ▲
-                               │ flags   │ flags   │ flags
-                      ┌────────┴─────────┴─────────┴──────────┐
-                      │        Hermes Agent                    │
-                      │        (AI Solver)                     │
-                      │  241 Kali MCP tools                    │
-                      │  reads slot_N.json → finds workdir     │
-                      │  all solving inside workdir            │
-                      └───────────────────────────────────────┘
-```
+**Runtime**: Hermes Agent + Kali-Security-MCP + GZCTF (or compatible platform)
 
-## 推荐部署方案 · Recommended Stack
-
-精灵需要四样东西才能施展全力：
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   Kali Linux                        │
-│  ┌───────────────────────────────────────────────┐ │
-│  │          Kali-Security-MCP (200+ tools)        │ │
-│  │  github.com/SeaC-25/Kali-Security-MCP          │ │
-│  │  nmap · sqlmap · nuclei · hydra · msf          │ │
-│  │  gobuster · pwnpasi · hashcat · john ...       │ │
-│  └──────────────────┬────────────────────────────┘ │
-│                     │ MCP Protocol                  │
-│  ┌──────────────────▼────────────────────────────┐ │
-│  │          Hermes Agent (AI brain)               │ │
-│  │  nousresearch.com/hermes-agent                 │ │
-│  └──────────────────┬────────────────────────────┘ │
-│                     │                              │
-│  ┌──────────────────▼────────────────────────────┐ │
-│  │          CTF 精灵 · Daemon (orchestrator)       │ │
-│  │  github.com/chaojixinren/ctf-daemon             │ │
-│  │  轮询 · 调度 · 超时 · 记忆 · 提交 · 隔离        │ │
-│  └──────────────────┬────────────────────────────┘ │
-└─────────────────────┼──────────────────────────────┘
-                      │
-                      ▼
-              ┌──────────────┐
-              │  GZCTF 平台   │
-              └──────────────┘
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│                        HERMES AGENT                               │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │              CTF DAEMON (orchestrator)                      │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐                    │  │
+│  │  │ Slot 0  │  │ Slot 1  │  │ Slot 2  │  … up to N slots   │  │
+│  │  │ workdir │  │ workdir │  │ workdir │    isolated per ch  │  │
+│  │  │ timeout │  │ timeout │  │ timeout │    independent retry │  │
+│  │  └────┬────┘  └────┬────┘  └────┬────┘                    │  │
+│  │       │            │            │                           │  │
+│  │       ▼            ▼            ▼                           │  │
+│  │  ┌─────────────────────────────────────────────────────┐   │  │
+│  │  │              Kali-Security-MCP (241 tools)           │   │  │
+│  │  │  nmap · sqlmap · nuclei · hydra · msf · pwnpasi     │   │  │
+│  │  │  gobuster · ffuf · hashcat · john · radare2 …       │   │  │
+│  │  └─────────────────────────────────────────────────────┘   │  │
+│  └────────────────────────────────────────────────────────────┘  │
+│       │                                                          │
+│       ▼                                                          │
+│  ┌────────────────────────────────────────────────────────────┐  │
+│  │                   GZCTF Platform                            │  │
+│  │  login · challenge fetch · container mgmt · flag submit     │  │
+│  └────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-| 组件 | 项目 | 作用 |
-|------|------|------|
-| 🐉 **Kali Linux** | 操作系统 | 200+ 安全工具的运行环境 |
-| 🔧 **Kali-Security-MCP** | [SeaC-25/Kali-Security-MCP](https://github.com/SeaC-25/Kali-Security-MCP) | 通过 MCP 协议将 Kali 工具暴露给 AI |
-| 🧠 **Hermes Agent** | [nousresearch/hermes-agent](https://github.com/nousresearch/hermes-agent) | AI 大脑，调用 MCP 工具解题 |
-| 👻 **CTF 精灵** | 本项目 | 调度中枢，管理一切流程 |
+## Stack
 
-### 部署步骤
+| Component | Role | Repository |
+|-----------|------|------------|
+| **Hermes Agent** | AI reasoning engine — reads slot tasks, calls tools, writes flags | [nousresearch/hermes-agent](https://github.com/nousresearch/hermes-agent) |
+| **Kali-Security-MCP** | Weapon arsenal — 241 Kali tools exposed via MCP protocol | [SeaC-25/Kali-Security-MCP](https://github.com/SeaC-25/Kali-Security-MCP) |
+| **CTF Daemon** | Orchestration core — dispatch, retry, cooldown, container lifecycle, platform sync | this repo |
+
+## Capabilities
+
+| Capability | Detail |
+|------------|--------|
+| **Concurrent dispatch** | Up to `CTF_CONCURRENT_SLOTS` challenges solved in parallel. One stuck slot does not block others. |
+| **Isolated workdirs** | Each challenge gets `/tmp/ctf_{title}_{id}/` — attachments, scripts, artifacts scoped per challenge. Zero file collision across 40+ challenges. |
+| **Container lifecycle** | Auto create, extend (>30 min), health-check (TCP connect + HTTP liveness probe), delete on free. Dead containers detected in ~9s with no retry penalty. |
+| **LLM-driven selection** | Daemon outputs challenge menu → Hermes LLM reads, analyzes difficulty, writes priority ordering → daemon dispatches by priority. No hardcoded heuristics. |
+| **Escalating backoff** | Failed challenges cool down: 60s → 120s → 240s → … → 1800s. Infrastructure failures (API 502, container death, rate limit) do not count as retries. |
+| **Platform-verified submission** | `submit_and_record()` polls status endpoint. Only marks `solved` on `Accepted`/`AlreadySolved`. Cross-references team submissions endpoint — never trusts local state alone. |
+| **Cross-challenge guard** | Flag files are JSON with `challenge_id`. Daemon verifies slot's current `ch_id` matches before submission. Prevents wrong-challenge flag submission. |
+| **Session resilience** | Auto re-login on cookie expiry. API retries with exponential backoff (3 attempts). Atomic file writes for menu/selection to avoid cron race. |
+| **Attempt history** | Records tools used, summaries, errors per challenge. Injected into retry context so the LLM learns from prior failures. |
+
+## Quick Start
 
 ```bash
-# 1. 安装 Kali-Security-MCP（武器库）
-git clone https://github.com/SeaC-25/Kali-Security-MCP.git ~/Kali-Security-MCP
-cd ~/Kali-Security-MCP
-pip install -r requirements.txt --break-system-packages
-python status_check.py
-
-# 2. 配置 Hermes（大脑）
-# 在 Hermes 的 config.yaml 中添加 Kali MCP server
-hermes config set mcp_servers.kali.command "python"
-hermes config set mcp_servers.kali.args '["/home/kali/Kali-Security-MCP/mcp_server.py"]'
-
-# 3. 召唤精灵（调度中枢）
-git clone https://github.com/chaojixinren/ctf-daemon.git ~/ctf-daemon
-cd ~/ctf-daemon
-cp config.env.example config.env
-# 编辑 config.env 填入 GZCTF 凭据
-
-# 4. 唤醒精灵
-hermes cronjob create \
-  --name "CTF 精灵" \
-  --schedule "every 1m" \
-  --script ctf_daemon.py \
-  --no-agent
-```
-
-## 精灵的能力 · What the Daemon Does
-
-| 能力 | 说明 |
-|------|------|
-| 📁 **目录隔离 (v3.4)** | 每道题拥有独立工作目录 `/tmp/ctf_{题目名}/`，附件/脚本/产物互不干扰 |
-| 🪞 **并发分身 (v3)** | 最多 3 个槽位同时跑不同题目，一个卡住不影响其他 |
-| 🔄 **轮询守护** | 每 60s 醒来一次，检查进度、提交 flag、分配新题 |
-| ⏰ **超时放弃** | 600s 解不出？自动放弃，换下一题，不堵路 |
-| 🛑 **中断信号** | 写 `/tmp/ctf_tasks/abort_N`，告诉 agent "别白费力气了" |
-| 📝 **记忆回溯** | 记录每次尝试用了什么工具、什么结果，重试时注入上下文 |
-| 🔙 **退避重试** | 失败后 60s→120s→240s→480s→1800s 逐级冷却，永不放弃 |
-| 🌐 **基础设施容错** | 网络抖动、API 502、LLM 限流 → 不扣重试次数 |
-| 📦 **容器全生命周期 (v3.4)** | 自动创建/续期/健康检查/删除；死容器 6s 检测，资源 0 残留 |
-| 🚩 **Flag 嗅探** | 扫描题目描述、附件内容、文件字符串 |
-| 🧠 **LLM 驱动选择** | Daemon 输出菜单 → LLM 分析难度 → 写回优先级排序 |
-| ✅ **平台交叉验证** | 提交后对比平台 ground truth，不盲目信任本地状态 |
-
-## 快速开始 · Quick Start
-
-### 1. 召唤精灵
-
-```bash
+# 1. Clone
 git clone https://github.com/chaojixinren/ctf-daemon.git
 cd ctf-daemon
-pip install requests python-dotenv
-```
+pip install requests
 
-### 2. 签订契约（配置）
-
-```bash
+# 2. Configure
 cp config.env.example config.env
+# Edit: GZCTF_BASE_URL, GZCTF_USERNAME, GZCTF_PASSWORD
+
+# 3. Run once (manual)
+python3 ctf_daemon.py
+
+# 4. Deploy as Hermes cron (autonomous)
+hermes cronjob create \
+  --name "CTF Daemon" \
+  --schedule "every 1m" \
+  --prompt "Run the CTF daemon: cd /path/to/ctf-daemon && python3 ctf_daemon.py. If MENU: read menu, pick 3 best challenges, write selection. Re-run. Solve dispatched slots. Write flags in JSON: {\"challenge_id\": N, \"flag\": \"...\"}"
 ```
+
+## Configuration
 
 ```ini
+# Platform credentials
 GZCTF_BASE_URL=http://your-gzctf-server:8080
 GZCTF_USERNAME=your_username
 GZCTF_PASSWORD=your_password
-GZCTF_GAME_ID=0          # 0 = 自动发现比赛
+GZCTF_GAME_ID=0              # 0 = auto-discover
 GZCTF_TEAM_NAME=AI_Solver
 
-# 精灵的脾气（可按需调整）
-CTF_TASK_TIMEOUT_SECONDS=600      # 单槽超时（秒）
-CTF_MAX_RETRIES_PER_CHALLENGE=4   # 最多重试几次
-CTF_BASE_RETRY_COOLDOWN=60        # 基础冷却（秒）
-CTF_MAX_RETRY_COOLDOWN=1800       # 最长冷却（秒）
-CTF_CONCURRENT_SLOTS=3            # 并发槽位数（1=v2兼容模式）
-CTF_WORKDIR_BASE=/tmp             # 题目工作目录基路径
+# Daemon tuning
+CTF_CONCURRENT_SLOTS=3        # parallel challenge slots
+CTF_TASK_TIMEOUT_SECONDS=600  # per-slot timeout before abort
+CTF_MAX_RETRIES_PER_CHALLENGE=4
+CTF_BASE_RETRY_COOLDOWN=60    # base backoff (seconds)
+CTF_MAX_RETRY_COOLDOWN=1800   # backoff ceiling (seconds)
+CTF_WORKDIR_BASE=/tmp         # per-challenge workdir root
 ```
 
-### 3. 唤醒精灵
+## Agent Loop
 
-```bash
-# 方式一：传统 cron
-(crontab -l 2>/dev/null; echo "* * * * * cd $(pwd) && python3 ctf_daemon.py >> /tmp/ctf_daemon.log 2>&1") | crontab -
+The Hermes agent executes this loop until the daemon outputs `DONE` (all challenges platform-verified solved):
 
-# 方式二：Hermes 契约
-hermes cronjob create \
-  --name "CTF Daemon Safety Net" \
-  --schedule "every 1m" \
-  --script ctf_daemon.py \
-  --no-agent
-```
-
-### 4. 手动驱使
-
-```bash
-python3 ctf_daemon.py                # 唤醒一次（写任务 / 收 flag）
-python3 solver.py status             # 查看精灵的状态
-python3 solver.py list               # 列出所有题目
-python3 submit_flag.py <id> "flag{...}"  # 手动献祭 flag
-```
-
-## Agent 如何与精灵协作 · The Loop
-
-```
+```text
 LOOP:
-  1. 运行 daemon: cd /path/to/ctf-daemon && python3 ctf_daemon.py
-     解析输出：
-     "MENU:N:..."         → Daemon 写了 /tmp/ctf_menu.jsonl，等待 LLM 选择
-                             第 2 步：LLM 读取菜单，分析难度，写回 selection
-     "DISPATCH:2/3:..."   → 槽位已填充。第 3 步：解题
-     "BUSY:3/3:..."       → 所有槽位占用中。第 3 步：解题
-     "WAITING:N..."       → 题目在冷却中。等待 60s，回到 1
-     "DONE"               → 全部题目平台验证通过。结束
+  1. Run daemon: python3 ctf_daemon.py
+     Parse output line:
+     "MENU:N:..."        → Daemon wrote /tmp/ctf_menu.jsonl. GOTO step 2.
+     "DISPATCH:N/3:..."   → Slots filled. GOTO step 3.
+     "BUSY:3/3:..."       → All slots busy. GOTO step 3.
+     "WAITING:N..."       → Challenges in cooldown. Wait 60s. GOTO 1.
+     "DONE"               → All verified solved on platform. STOP.
 
-  2. LLM SELECTION（daemon 输出 MENU 时）：
-     a. read_file /tmp/ctf_menu.jsonl — 分析每题：
-        - DynamicAttachment 优先于 DynamicContainer（无需等容器）
-        - 检查 content_preview 中是否已有 flag
-        - Misc/Crypto 通常比 Web/Pwn 容易
-     b. 选 3 道最有把握的题
-     c. write_file /tmp/ctf_selection.json:
+  2. LLM SELECTION:
+     a. read_file /tmp/ctf_menu.jsonl
+     b. Analyze: DynamicAttachment > DynamicContainer, check content_preview for flags
+     c. Pick 3 most promising challenges
+     d. write_file /tmp/ctf_selection.json:
         {"challenge_ids": ["id1","id2","id3"], "reasoning": "..."}
-     d. 回到 1（daemon 会读取 selection 并分发）
+     e. GOTO 1
 
-  3. SOLVE 已分发的槽位：
+  3. SOLVE dispatched slots:
      a. read_file /tmp/ctf_tasks/slot_N.json
-     b. 先检查 /tmp/ctf_tasks/abort_N — 如果存在，跳过此槽位
-     c. 查看 "workdir" 字段 → 所有解题都在该目录下进行
-        附件在 workdir 里，脚本写 workdir 里，中间文件放 workdir 里
-     d. 用 Kali MCP 工具解题
-     e. attempt_history 字段显示之前试过的工具 — 别重蹈覆辙
-     f. 找到 flag → write_file /tmp/ctf_tasks/flag_N.txt
-        内容只写 flag 字符串，例：dutctf{some_flag_here}
+     b. Check /tmp/ctf_tasks/abort_N first — if exists, skip this slot
+     c. All work in the "workdir" field's directory
+     d. Use Kali MCP tools (mcp_kali_*) to solve
+     e. attempt_history shows prior failures — do not repeat
+     f. Flag found → write_file /tmp/ctf_tasks/flag_N.txt:
+        {"challenge_id": <N>, "flag": "dutctf{...}"}
 
-  4. 回到 1
+  4. GOTO 1
 ```
 
-## 目录隔离架构 · Workdir Isolation (v3.4)
+## Filesystem Layout
 
-```
-/tmp/ctf_ez_dsa/              ← Ez_DSA 题目的家
-├── att.py                     ← 题目附件
-├── solve.py                   ← Agent 写的解题脚本
-└── output.txt                 ← 工具输出
-
-/tmp/ctf_cyberchef_recipe/    ← cyberchef_recipe 题目的家
-├── recipe                     ← 题目附件
-├── cyberchef_recipe.zip
-├── extract.py                 ← 解题脚本
-└── recipe_reversed.json
-
-/tmp/ctf_babyrop/              ← babyrop 题目的家
-├── babyrop                    ← 二进制附件
-├── exploit.py                 ← 利用脚本
-└── leak_output.bin
-
-/tmp/ctf_tasks/                ← 槽位文件（不变）
-├── slot_0.json                ← 含 "workdir" 字段指向对应目录
+```text
+/tmp/ctf_tasks/               # Slot directory (daemon-managed)
+├── slot_0.json               # Challenge task with workdir, tools, history
 ├── slot_1.json
-├── slot_2.json
-├── flag_0.txt                 ← Agent 写 flag 的地方
+├── flag_0.txt                # Agent writes JSON: {"challenge_id":N, "flag":"..."}
 ├── flag_1.txt
-└── abort_0
+├── abort_0                   # Daemon writes: stop working this slot
+└── abort_1
+
+/tmp/ctf_{title}_{id}/        # Per-challenge isolated workdir
+├── <attachment files>        # Downloaded by daemon
+├── exploit.py                # Agent-written scripts
+└── output.txt                # Tool outputs
+
+/tmp/ctf_menu.jsonl           # Daemon → LLM: eligible challenges
+/tmp/ctf_selection.json       # LLM → Daemon: priority ordering
+
+~/.hermes/ctf_state.json      # Persistent state (solved, retries, history)
 ```
 
-**命名规则**：题目名 → 小写 + 特殊字符转下划线 + `_{id}` 后缀保证唯一
-| 题目名 | 目录名 |
-|--------|--------|
+### Workdir Naming
+
+| Challenge Title | Workdir |
+|-----------------|---------|
 | `Hello_World` (ID:1) | `/tmp/ctf_hello_world_1/` |
-| `Flag_Checker` (ID:2) | `/tmp/ctf_flag_checker_2/` |
 | `!!! welcome !!!` (ID:3) | `/tmp/ctf_welcome_3/` |
+| `签到` (ID:7) | `/tmp/ctf_challenge_7/` |
+| `变异凯撒` (ID:9) | `/tmp/ctf_challenge_9/` |
 
-## 精灵的成长史 · Version History
+Chinese-only titles that sanitize to empty string are disambiguated by `_{id}` suffix.
 
-| 版本 | 新能力 |
-|------|--------|
-| **v3.4.4** | 🐛 纯中文标题碰撞修复：sanitize 后同名的题目通过 `_{id}` 后缀获得独立工作目录，不再冲突 |
-| **v3.3** | 平台交叉验证、永不放弃（移除 permanent_failed）、ID 漂移检测 |
-| **v3.2** | LLM 驱动选择：输出 MENU → LLM 分析难度 → 写回优先顺序 |
-| **v3.1** | 并发分身：多槽位同时运行，`CTF_CONCURRENT_SLOTS=3` |
-| **v2.1** | 中断信号（/tmp/ctf_tasks/abort_N）、尝试记忆（attempt_history） |
-| **v2.0** | 超时放弃、退避冷却、最大重试、基础设施容错 |
-| **v1.0** | 基础精灵模式：单槽轮询 - 出题 - 收 flag |
+## Manual Operations
 
-### v3.4 vs v3.3: What Changed
+```bash
+python3 ctf_daemon.py              # Run one daemon tick
+python3 solver.py status           # Dump state file
+python3 solver.py list             # List all challenges with status
+python3 submit_flag.py <id> "flag{...}"  # Manual flag submission
+```
 
-| | v3.3 | v3.4 |
-|---|------|------|
-| **附件目录** | 全部混在 `/tmp/ctf_attachments/` | 每题独立 `/tmp/ctf_{题目名}/` |
-| **工作目录** | Agent 自己决定（容易乱） | Daemon 创建，slot 文件明确指定 |
-| **容器管理** | 只创建不删除，残留在平台 | 创建/续期/探活/删除全闭环 |
-| **配置** | `ATTACHMENT_DIR` | `CTF_WORKDIR_BASE` |
-| **文件混乱** | 19 道题的附件同名冲突 | 完全隔离，互不干扰 |
+## Module Map
 
-## 灵感来源 · Inspiration
+| File | Purpose |
+|------|---------|
+| `ctf_daemon.py` | Orchestrator: login, fetch, LLM selection, dispatch, submit, container lifecycle, health checks |
+| `gzctf_client.py` | GZCTF REST API client — auth, challenges, containers, submissions, retry logic |
+| `state.py` | Persistent state: solved/retries/cooldowns/slots/history. Env-overridable paths. |
+| `challenge_engine.py` | Challenge analysis, flag extraction, strategy determination, file categorization |
+| `solver.py` | Standalone one-shot solver + `submit_and_record()` utility |
+| `submit_flag.py` | CLI manual flag submitter |
 
-- 并发任务模型借鉴了 [**LingXi（灵犀）**](https://github.com/chaojixinren/LingXi) —— "一道题卡住了，先去解别的"
-- GZCTF API 交互模式借鉴了 [**Misuzu**](https://github.com/TechnickOcean/Misuzu) 的 GZCTF 插件 —— 多 Agent 并发 CTF 系统
-- 工具链由 [**Kali-Security-MCP**](https://github.com/SeaC-25/Kali-Security-MCP) 提供 —— 200+ Kali 工具通过 MCP 协议暴露给 AI
+## Version History
 
-## 精灵的档案 · Files
+| Version | Changes |
+|---------|---------|
+| **v3.5.1** | JSON flag format with `challenge_id` guard. Container HTTP liveness probe. Per-team platform sync via `/submissions`. Session auto re-login. Bare-port `instanceEntry` fix. Structured container errors. Atomic menu/selection writes. API retry with exponential backoff. Enhanced flag filter. N+1 query optimization. |
+| **v3.4.4** | Pure-Chinese title workdir collision fix via `_{id}` suffix |
+| **v3.4.3** | Full container lifecycle: create/extend/health-check/delete |
+| **v3.4** | Per-challenge isolated workdirs |
+| **v3.3** | Platform cross-verification. Removed permanent failure — always retry. |
+| **v3.2** | LLM-driven challenge selection via menu/selection protocol |
+| **v3.1** | Multi-slot concurrency. Code quality fixes. Test suite. |
+| **v2.1** | Abort signaling + attempt history |
+| **v2.0** | Timeout, backoff cooldown, max retries, infrastructure fault tolerance |
 
-| 文件 | 用途 |
-|------|------|
-| `ctf_daemon.py` | **精灵本体 v3.4**。60s 循环，多槽位并发，LLM 选择，目录隔离，容器全生命周期。 |
-| `state.py` | 持久化状态管理（solved/retries/slots/history）+ `WORKDIR_BASE` 配置。 |
-| `solver.py` | 一次性求解器 + flag 提交工具函数。 |
-| `gzctf_client.py` | GZCTF REST API —— 登录、拉题、提交。 |
-| `challenge_engine.py` | 题目分析、flag 提取、策略判断。 |
-| `submit_flag.py` | 命令行手动提交 flag。 |
-| `config.env.example` | 契约模板（复制为 config.env 并填入凭据）。 |
-| `tests/` | 测试套件（57 个测试用例）。 |
-| `/tmp/ctf_tasks/` | v3 任务目录：slot_N.json / flag_N.txt / abort_N |
-| `/tmp/ctf_{题目名}/` | v3.4 题目隔离工作目录 |
+## Credits
 
-## 许可 · License
+- Concurrency model inspired by [LingXi (灵犀)](https://github.com/chaojixinren/LingXi)
+- GZCTF API patterns from [Misuzu](https://github.com/TechnickOcean/Misuzu)
+- Tool backend: [Kali-Security-MCP](https://github.com/SeaC-25/Kali-Security-MCP) by SeaC-25
+- AI runtime: [Hermes Agent](https://github.com/nousresearch/hermes-agent) by Nous Research
 
-MIT — 召唤精灵，赢得比赛。
+## License
+
+MIT
